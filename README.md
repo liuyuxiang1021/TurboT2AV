@@ -91,7 +91,7 @@ At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step 
 
 - Python >= 3.10
 - PyTorch >= 2.2.0
-- 8x or 32x GPUs (A100/H100 recommended)
+- 8x or 32x GPUs with 96GB+ memory (H200 recommended). Causal DMD branch may work on lower-memory GPUs.
 
 ### Installation
 
@@ -118,7 +118,7 @@ Download the following pretrained models and update the paths in the config file
 | `ltx-2-19b-dev.safetensors` | LTX-2 base model (19B), from [Lightricks/LTX-Video-2](https://huggingface.co/Lightricks/LTX-Video-2) |
 | `gemma-3-12b-it-qat-q4_0-unquantized` | Gemma 3 12B text encoder (unquantized QAT variant) |
 
-> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon.
+> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
 
 
 ## Training Pipeline
