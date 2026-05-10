@@ -41,7 +41,9 @@ def set_seed(seed: int) -> None:
 
 def launch_distributed_job() -> None:
     """Initialize distributed training environment."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    launched_with_torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+    if launched_with_torchrun:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -52,7 +54,9 @@ def launch_distributed_job() -> None:
 
     torch.cuda.set_device(local_rank)
 
-    if world_size > 1:
+    # FSDP expects the default process group to exist whenever we run under
+    # torchrun, even for WORLD_SIZE=1 smoke tests.
+    if launched_with_torchrun and not dist.is_initialized():
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
@@ -89,6 +93,7 @@ def fsdp_wrap(
     transformer_module: Optional[Tuple[type, ...]] = None,
     min_num_params: int = 1e8,
     cpu_offload: bool = False,
+    use_orig_params: bool = True,
 ) -> FSDP:
     """
     Wrap module with FSDP for distributed training.
@@ -101,6 +106,7 @@ def fsdp_wrap(
         transformer_module: Transformer block classes for transformer wrapping
         min_num_params: Minimum parameters for size-based wrapping
         cpu_offload: Enable CPU offload
+        use_orig_params: Whether to keep original parameter objects exposed
 
     Returns:
         FSDP-wrapped module
@@ -119,7 +125,9 @@ def fsdp_wrap(
         mp_policy = None
 
     # Wrap policy
-    if wrap_strategy == "transformer" and transformer_module is not None:
+    if wrap_strategy == "none":
+        wrap_policy = None
+    elif wrap_strategy == "transformer" and transformer_module is not None:
         wrap_policy = partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls=transformer_module,
@@ -141,18 +149,21 @@ def fsdp_wrap(
         auto_wrap_policy=wrap_policy,
         cpu_offload=offload_policy,
         device_id=torch.cuda.current_device(),
-        use_orig_params=True,
+        use_orig_params=use_orig_params,
     )
 
     return wrapped
 
 
-def fsdp_state_dict(module: FSDP) -> dict:
+def fsdp_state_dict(module: nn.Module) -> dict:
     """
-    Get full state dict from FSDP module.
+    Get full state dict from FSDP module or a regular nn.Module.
 
     Gathers sharded parameters to rank 0.
     """
+    if not isinstance(module, FSDP):
+        return module.state_dict()
+
     from torch.distributed.fsdp import (
         FullStateDictConfig,
         StateDictType,
@@ -185,8 +196,10 @@ def init_logging_folder(config) -> Tuple[str, str]:
     from omegaconf import OmegaConf
 
     # Create output directory – naming: {MMDD}_{HHMMSS}_{wandb_name}
-    timestamp = datetime.now().strftime("%m%d_%H%M%S")
-    run_dir_name = f"{timestamp}_{config.wandb_name}"
+    run_dir_name = os.environ.get("LTX_RUN_DIR_NAME")
+    if not run_dir_name:
+        timestamp = datetime.now().strftime("%m%d_%H%M%S")
+        run_dir_name = f"{timestamp}_{config.wandb_name}"
     output_path = os.path.join(config.output_path, run_dir_name)
     os.makedirs(output_path, exist_ok=True)
 
@@ -218,14 +231,23 @@ def init_logging_folder(config) -> Tuple[str, str]:
         wandb.init(**wandb_kwargs)
     except Exception as exc:
         # If rank 0 dies here, other ranks only report a later NCCL/TCPStore
-        # failure during output_path broadcast. Fall back to disabled WandB so
-        # training can proceed and the root cause remains visible on rank 0.
+        # failure during output_path broadcast. First fall back to offline mode
+        # so training can continue without a live network connection. If even
+        # offline init fails, fall back one last time to fully disabled mode.
         print(
             f"[WandB] init failed ({type(exc).__name__}: {exc}). "
-            "Falling back to disabled WandB mode."
+            "Falling back to offline WandB mode."
         )
-        os.environ["WANDB_MODE"] = "disabled"
-        wandb.init(mode="disabled", **wandb_kwargs)
+        os.environ["WANDB_MODE"] = "offline"
+        try:
+            wandb.init(mode="offline", **wandb_kwargs)
+        except Exception as offline_exc:
+            print(
+                f"[WandB] offline init failed ({type(offline_exc).__name__}: {offline_exc}). "
+                "Falling back to disabled WandB mode."
+            )
+            os.environ["WANDB_MODE"] = "disabled"
+            wandb.init(mode="disabled", **wandb_kwargs)
 
     return output_path, wandb_folder
 

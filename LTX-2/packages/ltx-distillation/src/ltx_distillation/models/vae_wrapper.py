@@ -191,6 +191,7 @@ def create_vae_wrappers(
     checkpoint_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    registry=None,
 ) -> tuple[VideoVAEWrapper, AudioVAEWrapper]:
     """
     Factory function to create VAE wrappers from checkpoint.
@@ -199,6 +200,8 @@ def create_vae_wrappers(
         checkpoint_path: Path to LTX-2 checkpoint
         device: Target device
         dtype: Model dtype
+        registry: Optional shared state registry. Accepted for compatibility
+            with callers that coordinate checkpoint caching across wrappers.
 
     Returns:
         Tuple of (VideoVAEWrapper, AudioVAEWrapper)
@@ -210,6 +213,7 @@ def create_vae_wrappers(
         dtype=dtype,
         device=torch.device("cpu"),
         checkpoint_path=checkpoint_path,
+        registry=registry,
     )
 
     video_decoder = ledger.video_decoder()

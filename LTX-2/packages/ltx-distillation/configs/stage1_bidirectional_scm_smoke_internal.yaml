@@ -1,0 +1,116 @@
+# =============================================================================
+# Stage 1: Bidirectional SCM-only Smoke Test (Internal JVP)
+# =============================================================================
+# Minimal one-step smoke test for validating SCM startup with layerwise/internal
+# JVP propagation instead of black-box external JVP.
+
+checkpoint_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/ltx-2-19b-dev.safetensors
+gemma_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/gemma-3-12b-it-qat-q4_0-unquantized
+
+model_name: ltx2_av
+
+generator_grad:
+  model: true
+real_score_grad:
+  model: false
+fake_score_grad:
+  model: true
+
+dmd_enabled: false
+critic_enabled: false
+dmd_style: rcm_trig
+dmd_p_D_shift: 5.0
+backward_trig_timesteps:
+  - 1.5
+  - 1.4
+  - 1.0
+
+denoising_step_list:
+  - 1000
+  - 757
+  - 522
+  - 0
+
+num_train_timestep: 1000
+
+real_video_guidance_scale: 3.0
+real_audio_guidance_scale: 5.0
+
+generator_task: bidirectional_av
+real_task_type: bidirectional_av
+fake_task_type: bidirectional_av
+
+denoising_loss_type: velocity
+distillation_loss: dmd
+
+scm_enabled: true
+scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/omniforcing_latent_20k
+scm_batch_size: 1
+scm_max_pair: 100000000
+scm_weight: 1.0
+scm_loss_scale: 100.0
+scm_p_G_mean: 0.7
+scm_p_G_std: 1.6
+scm_fd_type: 0
+scm_strict_rcm: true
+scm_jvp_impl: internal
+scm_fd_size: 1.0e-4
+scm_tangent_warmup: 200
+scm_time_eps: 1.0e-4
+debug_scm_trace: true
+
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+
+lr: 2.0e-05
+generator_lr: 2.0e-05
+critic_lr: 2.0e-05
+
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+dfake_gen_update_ratio: 1
+max_grad_norm: 3.0
+
+scheduler_type: constant
+
+data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/release_prompts.txt
+backward_simulation: true
+
+negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+
+num_frames: 121
+video_height: 512
+video_width: 768
+
+sharding_strategy: full_shard
+fsdp_use_orig_params: true
+generator_fsdp_enabled: false
+generator_fsdp_wrap_strategy: none
+real_score_cpu_offload: true
+text_encoder_cpu_offload: false
+
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+output_path: /data/datasets/turbodiff_datasets_and_ckpt/my_omniforcing_smoke
+log_iters: 1
+checkpoint_iters: 0
+max_steps: 1
+
+wandb_project: OmniForcing
+wandb_entity: liuyuxiang1021-tianjin-university
+wandb_name: stage1_bidirectional_scm_smoke_internal
+wandb_api_key: "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"
+
+seed: 42
+
+benchmark_enabled: false
+benchmark_iters: 0
+benchmark_num_prompts: 0
+benchmark_seed: 12345
+benchmark_video_fps: 24
+benchmark_audio_sample_rate: 24000
+teacher_benchmark_enabled: false

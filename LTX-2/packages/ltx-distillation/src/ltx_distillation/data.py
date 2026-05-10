@@ -2,7 +2,9 @@
 Dataset classes for DMD distillation.
 """
 
+import bisect
 import os
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -69,6 +71,10 @@ class ODERegressionLMDBDataset(Dataset):
         - prompts_{idx}_data: prompt string bytes
         - video_latents_shape: "[total, T, F, C, H, W]"
         - audio_latents_shape: "[total, T, F_a, C]"
+
+    The input path can be either:
+        - a single LMDB directory
+        - a root directory containing multiple shard LMDBs named `shard_*`
     """
 
     def __init__(
@@ -86,45 +92,128 @@ class ODERegressionLMDBDataset(Dataset):
 
         try:
             import lmdb
-            self.env = lmdb.open(
-                lmdb_path,
-                readonly=True,
-                lock=False,
-                readahead=False,
-                meminit=False,
-            )
+            self.envs = []
+            self.shard_lengths = []
+            self.cumulative_lengths = []
+            self.shard_paths = self._discover_lmdb_paths(lmdb_path)
+            self.is_sharded = len(self.shard_paths) > 1
 
-            # Get shape metadata
-            with self.env.begin(write=False) as txn:
-                # Parse video shape: "[total, T, F, C, H, W]"
-                video_shape_bytes = txn.get("video_latents_shape".encode())
-                if video_shape_bytes is None:
-                    raise ValueError("Missing video_latents_shape in LMDB")
-                video_shape_str = video_shape_bytes.decode()
-                video_shape = list(map(int, video_shape_str.split()))
-                self.length = min(video_shape[0], max_pair)
-                self.video_entry_shape = video_shape[1:]  # [T, F, C, H, W]
+            remaining = max_pair
+            self.video_entry_shape = None
+            self.audio_entry_shape = None
+            self.has_audio = False
 
-                # Parse audio shape: "[total, T, F_a, C]" (may not exist)
-                audio_shape_bytes = txn.get("audio_latents_shape".encode())
-                if audio_shape_bytes is not None:
-                    audio_shape_str = audio_shape_bytes.decode()
-                    audio_shape = list(map(int, audio_shape_str.split()))
-                    self.audio_entry_shape = audio_shape[1:]  # [T, F_a, C]
-                    self.has_audio = True
+            for shard_path in self.shard_paths:
+                if remaining <= 0:
+                    break
+
+                env = lmdb.open(
+                    str(shard_path),
+                    readonly=True,
+                    lock=False,
+                    readahead=False,
+                    meminit=False,
+                )
+                shard_length, video_entry_shape, audio_entry_shape, has_audio = self._read_shape_metadata(
+                    env, str(shard_path)
+                )
+                shard_length = min(shard_length, remaining)
+                remaining -= shard_length
+
+                if self.video_entry_shape is None:
+                    self.video_entry_shape = video_entry_shape
+                    self.audio_entry_shape = audio_entry_shape
+                    self.has_audio = has_audio
                 else:
-                    self.audio_entry_shape = None
-                    self.has_audio = False
+                    if self.video_entry_shape != video_entry_shape:
+                        raise ValueError(
+                            f"Inconsistent video shape in shard {shard_path}: "
+                            f"{video_entry_shape} vs {self.video_entry_shape}"
+                        )
+                    if self.audio_entry_shape != audio_entry_shape:
+                        raise ValueError(
+                            f"Inconsistent audio shape in shard {shard_path}: "
+                            f"{audio_entry_shape} vs {self.audio_entry_shape}"
+                        )
+                    if self.has_audio != has_audio:
+                        raise ValueError(
+                            f"Inconsistent audio availability in shard {shard_path}: "
+                            f"{has_audio} vs {self.has_audio}"
+                        )
+
+                self.envs.append(env)
+                self.shard_lengths.append(shard_length)
+                cumulative = shard_length if not self.cumulative_lengths else self.cumulative_lengths[-1] + shard_length
+                self.cumulative_lengths.append(cumulative)
+
+            self.length = self.cumulative_lengths[-1] if self.cumulative_lengths else 0
 
         except ImportError:
             raise ImportError("lmdb package required for ODERegressionLMDBDataset")
         except Exception as e:
             raise RuntimeError(f"Failed to open LMDB at {lmdb_path}: {e}")
 
-        print(f"Loaded LMDB dataset with {self.length} samples from {lmdb_path}")
+        if self.is_sharded:
+            print(
+                f"Loaded sharded LMDB dataset with {self.length} samples "
+                f"from {lmdb_path} across {len(self.envs)} shard(s)"
+            )
+        else:
+            print(f"Loaded LMDB dataset with {self.length} samples from {lmdb_path}")
         print(f"  Video shape per entry: {self.video_entry_shape}")
         if self.has_audio:
             print(f"  Audio shape per entry: {self.audio_entry_shape}")
+
+    @staticmethod
+    def _discover_lmdb_paths(lmdb_path: str) -> list[Path]:
+        root = Path(lmdb_path)
+        if not root.exists():
+            raise FileNotFoundError(f"LMDB path not found: {lmdb_path}")
+
+        if (root / "data.mdb").exists():
+            return [root]
+
+        shard_paths = sorted(
+            (
+                path
+                for path in root.iterdir()
+                if path.is_dir() and path.name.startswith("shard_") and (path / "data.mdb").exists()
+            ),
+            key=lambda path: path.name,
+        )
+        if shard_paths:
+            return shard_paths
+
+        raise FileNotFoundError(
+            f"No LMDB found at {lmdb_path}. Expected either data.mdb or shard_* subdirectories."
+        )
+
+    @staticmethod
+    def _read_shape_metadata(env, lmdb_path: str) -> tuple[int, list[int], Optional[list[int]], bool]:
+        with env.begin(write=False) as txn:
+            video_shape_bytes = txn.get("video_latents_shape".encode())
+            if video_shape_bytes is None:
+                raise ValueError(f"Missing video_latents_shape in LMDB: {lmdb_path}")
+            video_shape = list(map(int, video_shape_bytes.decode().split()))
+            count = video_shape[0]
+            video_entry_shape = video_shape[1:]
+
+            audio_shape_bytes = txn.get("audio_latents_shape".encode())
+            if audio_shape_bytes is not None:
+                audio_shape = list(map(int, audio_shape_bytes.decode().split()))
+                audio_entry_shape = audio_shape[1:]
+                has_audio = True
+            else:
+                audio_entry_shape = None
+                has_audio = False
+
+        return count, video_entry_shape, audio_entry_shape, has_audio
+
+    def _get_env_for_index(self, idx: int):
+        shard_idx = bisect.bisect_right(self.cumulative_lengths, idx)
+        previous_total = 0 if shard_idx == 0 else self.cumulative_lengths[shard_idx - 1]
+        local_idx = idx - previous_total
+        return self.envs[shard_idx], local_idx
 
     def __len__(self) -> int:
         return self.length
@@ -139,19 +228,21 @@ class ODERegressionLMDBDataset(Dataset):
                 - ode_latent: ODE video trajectory [T, F, C, H, W]
                 - ode_audio_latent: ODE audio trajectory [T, F_a, C] (if available)
         """
-        with self.env.begin(write=False) as txn:
+        env, local_idx = self._get_env_for_index(idx)
+
+        with env.begin(write=False) as txn:
             # Load prompt
-            prompt_key = f"prompts_{idx}_data".encode()
+            prompt_key = f"prompts_{local_idx}_data".encode()
             prompt_bytes = txn.get(prompt_key)
             if prompt_bytes is None:
-                raise KeyError(f"Prompt key {idx} not found in LMDB")
+                raise KeyError(f"Prompt key {idx} (local {local_idx}) not found in LMDB")
             prompt = prompt_bytes.decode('utf-8')
 
             # Load video latents
-            video_key = f"video_latents_{idx}_data".encode()
+            video_key = f"video_latents_{local_idx}_data".encode()
             video_bytes = txn.get(video_key)
             if video_bytes is None:
-                raise KeyError(f"Video latents key {idx} not found in LMDB")
+                raise KeyError(f"Video latents key {idx} (local {local_idx}) not found in LMDB")
             video_array = np.frombuffer(video_bytes, dtype=np.float16)
             video_array = video_array.reshape(self.video_entry_shape)
             video_tensor = torch.from_numpy(video_array.copy()).float()
@@ -159,7 +250,7 @@ class ODERegressionLMDBDataset(Dataset):
             # Load audio latents (if available)
             audio_tensor = None
             if self.has_audio:
-                audio_key = f"audio_latents_{idx}_data".encode()
+                audio_key = f"audio_latents_{local_idx}_data".encode()
                 audio_bytes = txn.get(audio_key)
                 if audio_bytes is not None:
                     audio_array = np.frombuffer(audio_bytes, dtype=np.float16)
@@ -175,6 +266,17 @@ class ODERegressionLMDBDataset(Dataset):
             result["ode_audio_latent"] = audio_tensor  # [T, F_a, C]
 
         return result
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        for env in getattr(self, "envs", []):
+            try:
+                env.close()
+            except Exception:
+                pass
+        self.envs = []
 
 
 def collate_text_prompts(batch: List[str]) -> List[str]:

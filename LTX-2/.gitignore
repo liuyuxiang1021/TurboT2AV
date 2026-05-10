@@ -40,4 +40,6 @@ tmp
 *.wav
 *.webp
 
-LTX-2/eval/outputs/*
+LTX-2/eval/outputs/*# pixi environments
+.pixi/*
+!.pixi/config.toml

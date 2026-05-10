@@ -88,6 +88,38 @@ echo "Nodes:         $NNODES  |  GPUs/Node: $NPROC_PER_NODE  |  Total: $TOTAL_GP
 echo "Master:        $MASTER_ADDR:$MASTER_PORT"
 echo "========================================================"
 
+readarray -t CONFIG_LOG_VALUES < <(
+python - <<'PY' "$CONFIG_PATH"
+import sys
+cfg_path = sys.argv[1]
+output_path = ""
+wandb_name = ""
+with open(cfg_path, "r", encoding="utf-8") as f:
+    for line in f:
+        s = line.strip()
+        if s.startswith("output_path:") and not output_path:
+            output_path = s.split(":", 1)[1].strip().strip('"').strip("'")
+        elif s.startswith("wandb_name:") and not wandb_name:
+            wandb_name = s.split(":", 1)[1].strip().strip('"').strip("'")
+print(output_path)
+print(wandb_name)
+PY
+)
+CONFIG_OUTPUT_PATH="${CONFIG_LOG_VALUES[0]:-}"
+CONFIG_WANDB_NAME="${CONFIG_LOG_VALUES[1]:-stage1_bidirectional_dmd}"
+if [ -n "$CONFIG_OUTPUT_PATH" ]; then
+    RUN_DIR_NAME="${RUN_DIR_NAME:-$(date +%m%d_%H%M%S)_${CONFIG_WANDB_NAME}}"
+    export LTX_RUN_DIR_NAME="$RUN_DIR_NAME"
+    RUN_OUTPUT_PATH="$CONFIG_OUTPUT_PATH/$RUN_DIR_NAME"
+    mkdir -p "$RUN_OUTPUT_PATH"
+    LOG_FILE_DEFAULT="$RUN_OUTPUT_PATH/train.log"
+else
+    LOG_FILE_DEFAULT="train.log"
+fi
+LOG_FILE="${LOG_FILE:-$LOG_FILE_DEFAULT}"
+echo "Logging:       ${LOG_FILE}"
+echo "========================================================"
+
 torchrun \
     --nnodes=$NNODES \
     --nproc_per_node=$NPROC_PER_NODE \
@@ -96,4 +128,5 @@ torchrun \
     --master_port=$MASTER_PORT \
     -m ltx_distillation.train_distillation \
     --config_path "$CONFIG_PATH" \
-    "$@"
+    "$@" \
+    2>&1 | tee "$LOG_FILE"

@@ -1,20 +1,13 @@
 # =============================================================================
-# Stage 1: Bidirectional DMD Distillation
+# Stage 1: Bidirectional rCM Distillation (DMD + SCM)
 # =============================================================================
-# Distills LTX-2 teacher (1000-step) into a fast 4-step bidirectional model.
-# This model serves as the teacher and critic for later causal stages.
-#
-# CFG: video=3.0, audio=5.0
+# This is the faithful Stage-1 rCM configuration for OmniForcing/LTX:
+# - DMD uses rollout-generated samples in TrigFlow time
+# - SCM uses real clean latents from an ODE LMDB dataset
 
-# =============================================================================
-# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
-# =============================================================================
 checkpoint_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/ltx-2-19b-dev.safetensors
 gemma_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/gemma-3-12b-it-qat-q4_0-unquantized
 
-# =============================================================================
-# Model Configuration
-# =============================================================================
 model_name: ltx2_av
 
 generator_grad:
@@ -24,11 +17,6 @@ real_score_grad:
 fake_score_grad:
   model: true
 
-# =============================================================================
-# DMD Hyperparameters
-# =============================================================================
-dmd_enabled: true
-critic_enabled: true
 dmd_style: rcm_trig
 dmd_p_D_shift: 5.0
 backward_trig_timesteps:
@@ -36,7 +24,6 @@ backward_trig_timesteps:
   - 1.4
   - 1.0
 
-# Legacy RF/sigma few-step schedule. Used only when dmd_style=legacy.
 denoising_step_list:
   - 1000
   - 757
@@ -55,25 +42,20 @@ fake_task_type: bidirectional_av
 denoising_loss_type: velocity
 distillation_loss: dmd
 
-# =============================================================================
-# SCM Configuration (disabled by default for DMD-only runs)
-# =============================================================================
-scm_enabled: false
-scm_data_path: /path/to/data/ode_lmdb
+scm_enabled: true
+scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/my_omniforcing/scm_latent_teacher_native_rf_debug40
 scm_batch_size: 1
-scm_max_pair: 100000000
+scm_max_pair: 40
 scm_weight: 1.0
 scm_loss_scale: 100.0
 scm_p_G_mean: 0.7
 scm_p_G_std: 1.6
 scm_fd_type: 0
+scm_strict_rcm: true
 scm_fd_size: 1.0e-4
 scm_tangent_warmup: 1000
 scm_time_eps: 1.0e-4
 
-# =============================================================================
-# Training Configuration
-# =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
 batch_size: 1
@@ -89,28 +71,16 @@ dfake_gen_update_ratio: 5
 max_grad_norm: 3.0
 
 scheduler_type: constant
-# max_steps: 20000
 
-# =============================================================================
-# Data Configuration
-# =============================================================================
-# Path to text prompts file (one prompt per line).
-# Generate enhanced prompts using: LTX-2/packages/pe/batch_enhance.py
 data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/release_prompts.txt
 backward_simulation: true
 
 negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
 
-# =============================================================================
-# Video/Audio Configuration
-# =============================================================================
 num_frames: 121
 video_height: 512
 video_width: 768
 
-# =============================================================================
-# FSDP Configuration
-# =============================================================================
 sharding_strategy: hybrid_full
 
 generator_fsdp_wrap_strategy: size
@@ -118,29 +88,24 @@ real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 text_encoder_fsdp_wrap_strategy: size
 
-# =============================================================================
-# Logging and Checkpointing
-# =============================================================================
 output_path: /data/datasets/turbodiff_datasets_and_ckpt/my_omniforcing
-log_iters: 200
+log_iters: 1
+max_steps: 1
 
 wandb_project: OmniForcing
 wandb_entity: liuyuxiang1021-tianjin-university
-wandb_name: stage1_bidirectional_dmd
+wandb_name: stage1_bidirectional_rcm_debug
 wandb_api_key: "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"
 
 seed: 42
 
-# =============================================================================
-# Benchmark
-# =============================================================================
-benchmark_enabled: true
+benchmark_enabled: false
 benchmark_iters: 50
 benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24
 benchmark_audio_sample_rate: 24000
-teacher_benchmark_enabled: true
+teacher_benchmark_enabled: false
 teacher_benchmark_num_inference_steps: 40
 teacher_benchmark_video_guidance_scale: 3.0
 teacher_benchmark_audio_guidance_scale: 5.0

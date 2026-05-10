@@ -444,6 +444,7 @@ def create_ltx2_wrapper(
     dtype: torch.dtype = torch.bfloat16,
     video_height: int = 512,
     video_width: int = 768,
+    registry=None,
 ) -> LTX2DiffusionWrapper:
     """
     Factory function to create LTX2DiffusionWrapper from checkpoint.
@@ -455,6 +456,8 @@ def create_ltx2_wrapper(
         dtype: Model dtype
         video_height: Video height
         video_width: Video width
+        registry: Optional shared state registry. Accepted for compatibility
+            with callers that coordinate checkpoint caching across wrappers.
 
     Returns:
         Configured LTX2DiffusionWrapper
@@ -469,6 +472,7 @@ def create_ltx2_wrapper(
         device=torch.device("cpu"),  # Load to CPU first
         checkpoint_path=checkpoint_path,
         gemma_root_path=gemma_path,
+        registry=registry,
     )
 
     # Get X0Model (wraps velocity model)

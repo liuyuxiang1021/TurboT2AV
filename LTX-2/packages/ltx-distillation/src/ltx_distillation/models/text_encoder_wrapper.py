@@ -95,6 +95,7 @@ def create_text_encoder_wrapper(
     gemma_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    registry=None,
 ) -> GemmaTextEncoderWrapper:
     """
     Factory function to create GemmaTextEncoderWrapper from checkpoint.
@@ -104,6 +105,8 @@ def create_text_encoder_wrapper(
         gemma_path: Path to Gemma text encoder
         device: Target device
         dtype: Model dtype
+        registry: Optional shared state registry. Accepted for compatibility
+            with callers that coordinate checkpoint caching across wrappers.
 
     Returns:
         Configured GemmaTextEncoderWrapper
@@ -116,6 +119,7 @@ def create_text_encoder_wrapper(
         device=torch.device("cpu"),
         checkpoint_path=checkpoint_path,
         gemma_root_path=gemma_path,
+        registry=registry,
     )
 
     text_encoder = ledger.text_encoder()

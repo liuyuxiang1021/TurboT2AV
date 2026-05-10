@@ -28,6 +28,7 @@ class BidirectionalAVTrajectoryPipeline:
         generator: nn.Module,
         add_noise_fn,
         denoising_sigmas: torch.Tensor,
+        use_trigflow: bool = False,
     ):
         """
         Args:
@@ -39,6 +40,17 @@ class BidirectionalAVTrajectoryPipeline:
         self.generator = generator
         self.add_noise_fn = add_noise_fn
         self.denoising_sigmas = denoising_sigmas
+        self.use_trigflow = use_trigflow
+
+    @staticmethod
+    def _trig_recorrupt(
+        clean: torch.Tensor,
+        noise: torch.Tensor,
+        trig_t: torch.Tensor,
+    ) -> torch.Tensor:
+        cos_t = torch.cos(trig_t).to(device=clean.device, dtype=clean.dtype)
+        sin_t = torch.sin(trig_t).to(device=clean.device, dtype=clean.dtype)
+        return cos_t * clean + sin_t * noise
 
     @torch.no_grad()
     def inference_with_trajectory(
@@ -93,26 +105,25 @@ class BidirectionalAVTrajectoryPipeline:
             next_sigma = self.denoising_sigmas[i + 1]
 
             if next_sigma > 0:
-                # Re-corrupt with next sigma level
-                # For flow matching: x_t = (1 - sigma) * x_0 + sigma * eps
-                # We need to add noise at the next sigma level
-
-                # Sample fresh noise
                 fresh_noise_video = torch.randn_like(video_noise)
                 fresh_noise_audio = torch.randn_like(audio_noise)
 
-                next_video_sigma = next_sigma * torch.ones([B, F_v], device=device)
-                next_audio_sigma = next_sigma * torch.ones([B, F_a], device=device)
+                if self.use_trigflow:
+                    noisy_video = self._trig_recorrupt(pred_video, fresh_noise_video, next_sigma)
+                    noisy_audio = self._trig_recorrupt(pred_audio, fresh_noise_audio, next_sigma)
+                else:
+                    next_video_sigma = next_sigma * torch.ones([B, F_v], device=device)
+                    next_audio_sigma = next_sigma * torch.ones([B, F_a], device=device)
 
-                noisy_video = self.add_noise_fn(
-                    pred_video.flatten(0, 1),
-                    fresh_noise_video.flatten(0, 1),
-                    next_video_sigma.flatten(0, 1),
-                ).unflatten(0, (B, F_v))
+                    noisy_video = self.add_noise_fn(
+                        pred_video.flatten(0, 1),
+                        fresh_noise_video.flatten(0, 1),
+                        next_video_sigma.flatten(0, 1),
+                    ).unflatten(0, (B, F_v))
 
-                noisy_audio = self.add_noise_fn(
-                    pred_audio, fresh_noise_audio, next_audio_sigma
-                )
+                    noisy_audio = self.add_noise_fn(
+                        pred_audio, fresh_noise_audio, next_audio_sigma
+                    )
             else:
                 # At t=0, just use the prediction
                 noisy_video = pred_video
@@ -141,6 +152,7 @@ class BidirectionalAVInferencePipeline:
         generator: nn.Module,
         add_noise_fn,
         denoising_sigmas: torch.Tensor,
+        use_trigflow: bool = False,
     ):
         """
         Args:
@@ -151,6 +163,17 @@ class BidirectionalAVInferencePipeline:
         self.generator = generator
         self.add_noise_fn = add_noise_fn
         self.denoising_sigmas = denoising_sigmas
+        self.use_trigflow = use_trigflow
+
+    @staticmethod
+    def _trig_recorrupt(
+        clean: torch.Tensor,
+        noise: torch.Tensor,
+        trig_t: torch.Tensor,
+    ) -> torch.Tensor:
+        cos_t = torch.cos(trig_t).to(device=clean.device, dtype=clean.dtype)
+        sin_t = torch.sin(trig_t).to(device=clean.device, dtype=clean.dtype)
+        return cos_t * clean + sin_t * noise
 
     @torch.no_grad()
     def generate(
@@ -205,22 +228,25 @@ class BidirectionalAVInferencePipeline:
             next_sigma = self.denoising_sigmas[i + 1]
 
             if next_sigma > 0:
-                # Euler step or re-corruption
                 fresh_noise_video = torch.randn_like(video)
                 fresh_noise_audio = torch.randn_like(audio)
 
-                next_video_sigma = next_sigma * torch.ones([B, F_v], device=device)
-                next_audio_sigma = next_sigma * torch.ones([B, F_a], device=device)
+                if self.use_trigflow:
+                    video = self._trig_recorrupt(pred_video, fresh_noise_video, next_sigma)
+                    audio = self._trig_recorrupt(pred_audio, fresh_noise_audio, next_sigma)
+                else:
+                    next_video_sigma = next_sigma * torch.ones([B, F_v], device=device)
+                    next_audio_sigma = next_sigma * torch.ones([B, F_a], device=device)
 
-                video = self.add_noise_fn(
-                    pred_video.flatten(0, 1),
-                    fresh_noise_video.flatten(0, 1),
-                    next_video_sigma.flatten(0, 1),
-                ).unflatten(0, (B, F_v))
+                    video = self.add_noise_fn(
+                        pred_video.flatten(0, 1),
+                        fresh_noise_video.flatten(0, 1),
+                        next_video_sigma.flatten(0, 1),
+                    ).unflatten(0, (B, F_v))
 
-                audio = self.add_noise_fn(
-                    pred_audio, fresh_noise_audio, next_audio_sigma
-                )
+                    audio = self.add_noise_fn(
+                        pred_audio, fresh_noise_audio, next_audio_sigma
+                    )
             else:
                 video = pred_video
                 audio = pred_audio

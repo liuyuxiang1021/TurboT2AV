@@ -10,21 +10,30 @@ Key differences from CausVid:
 - Supports audio-video time alignment
 """
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import Tuple, Dict, Any, Optional, List
 import math
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ltx_core.loader.registry import StateDictRegistry
 
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.model.transformer.attention import AttentionFunction
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+except ImportError:
+    sdpa_kernel = None
+    SDPBackend = None
 
-from ltx_distillation.models.ltx_wrapper import LTX2DiffusionWrapper, create_ltx2_wrapper
+from ltx_distillation.models.ltx_wrapper import create_ltx2_wrapper
+from ltx_distillation.models.ltx_trig_wrapper import create_ltx2_trig_wrapper
 from ltx_distillation.models.text_encoder_wrapper import GemmaTextEncoderWrapper, create_text_encoder_wrapper
 from ltx_distillation.models.vae_wrapper import VideoVAEWrapper, AudioVAEWrapper, create_vae_wrappers
 from ltx_distillation.loss import get_denoising_loss
+from ltx_distillation.time_utils import rf_to_trig_time, shift_rf_time, sigma_to_rf_time
 try:
     from ltx_causal.wrapper import CausalLTX2DiffusionWrapper
     from ltx_causal.attention.mask_builder import compute_av_blocks
@@ -105,6 +114,10 @@ class LTX2DMD(nn.Module):
         self.real_score_use_causal_wrapper = bool(
             getattr(args, "real_score_use_causal_wrapper", "causal" in str(self.real_task_type).lower())
         )
+        self.dmd_enabled = bool(getattr(args, "dmd_enabled", True))
+        self.critic_enabled = bool(getattr(args, "critic_enabled", True))
+        self.dcm_enabled = bool(getattr(args, "dcm_enabled", False))
+        self.need_fake_score = self.dmd_enabled or self.critic_enabled
         self.fake_score_use_causal_wrapper = bool(
             getattr(args, "fake_score_use_causal_wrapper", "causal" in str(self.fake_task_type).lower())
         )
@@ -116,7 +129,7 @@ class LTX2DMD(nn.Module):
         if (
             self.generator_use_causal_wrapper
             or self.real_score_use_causal_wrapper
-            or self.fake_score_use_causal_wrapper
+            or (self.need_fake_score and self.fake_score_use_causal_wrapper)
         ) and CausalLTX2DiffusionWrapper is None:
             raise ImportError(
                 "Causal wrapper requires ltx-causal package. "
@@ -154,6 +167,7 @@ class LTX2DMD(nn.Module):
         self.text_encoder: GemmaTextEncoderWrapper = None
         self.video_vae: VideoVAEWrapper = None
         self.audio_vae: AudioVAEWrapper = None
+        self._generator_fsdp_jvp_primed = False
 
         # DMD hyperparameters
         self.num_train_timestep = args.num_train_timestep
@@ -161,6 +175,66 @@ class LTX2DMD(nn.Module):
         self.max_step = int(0.98 * self.num_train_timestep)
         self.real_video_guidance_scale = getattr(args, "real_video_guidance_scale", 3.0)
         self.real_audio_guidance_scale = getattr(args, "real_audio_guidance_scale", 7.0)
+        self.dmd_style = str(getattr(args, "dmd_style", "legacy")).lower()
+        self.use_rcm_style_dmd = self.dmd_style in {"rcm", "rcm_trig", "trig"}
+        self.dmd_p_D_shift = float(getattr(args, "dmd_p_D_shift", 5.0))
+        self.backward_trig_timesteps = [
+            float(t) for t in getattr(args, "backward_trig_timesteps", [1.5, 1.4, 1.0])
+        ]
+        self.scm_enabled = bool(getattr(args, "scm_enabled", False))
+        self.scm_weight = float(getattr(args, "scm_weight", 1.0))
+        self.scm_loss_scale = float(getattr(args, "scm_loss_scale", 100.0))
+        self.dcm_weight = float(getattr(args, "dcm_weight", 1.0))
+        self.dcm_loss_scale = float(getattr(args, "dcm_loss_scale", 100.0))
+        self.dcm_total_steps = int(getattr(args, "dcm_total_steps", 48))
+        self.dcm_skipping_interval_steps = int(
+            getattr(args, "dcm_skipping_interval_steps", 1)
+        )
+        self.dcm_timestep_shift = float(getattr(args, "dcm_timestep_shift", 5.0))
+        # Align SCM time sampling with the original rCM implementation.
+        self.scm_p_G_mean = float(getattr(args, "scm_p_G_mean", 0.7))
+        self.scm_p_G_std = float(getattr(args, "scm_p_G_std", 1.6))
+        # fd_type semantics from the original rCM code:
+        #   0 -> SCM JVP path
+        #   1 -> semi-continuous hybrid ablation
+        #   2 -> discrete finite-difference ablation
+        # The faithful SCM route is fd_type=0; keep the other branches only as
+        # opt-in diagnostics, not as the default training path.
+        self.scm_fd_type = int(getattr(args, "scm_fd_type", 0))
+        self.scm_strict_rcm = bool(getattr(args, "scm_strict_rcm", True))
+        self.scm_jvp_impl = str(getattr(args, "scm_jvp_impl", "torch_func")).lower()
+        self.scm_jvp_num_chunks = max(1, int(getattr(args, "scm_jvp_num_chunks", 1)))
+        self.scm_jvp_video_chunks = max(
+            1, int(getattr(args, "scm_jvp_video_chunks", self.scm_jvp_num_chunks))
+        )
+        self.scm_jvp_audio_chunks = max(
+            1, int(getattr(args, "scm_jvp_audio_chunks", self.scm_jvp_num_chunks))
+        )
+        self.scm_jvp_offload_chunks_to_cpu = bool(
+            getattr(args, "scm_jvp_offload_chunks_to_cpu", False)
+        )
+        self.scm_fd_size = float(getattr(args, "scm_fd_size", 1e-4))
+        self.scm_tangent_warmup = int(getattr(args, "scm_tangent_warmup", 1000))
+        self.scm_time_eps = float(getattr(args, "scm_time_eps", 1e-4))
+        self.scm_tangent_clip_mean = float(
+            getattr(args, "scm_tangent_clip_mean", 0.0)
+        )
+        self.scm_tangent_reject_mean = float(
+            getattr(args, "scm_tangent_reject_mean", 0.0)
+        )
+        # Keep the default aligned with the stable 0422_170731 SCM run. That
+        # config did not explicitly set this field, and its observed loss scale
+        # matches per-modality normalization. Joint-state normalization remains
+        # available as an explicit ablation via scm_g_normalization: joint.
+        self.scm_g_normalization = str(
+            getattr(args, "scm_g_normalization", "per_modality")
+        ).lower()
+        if self.scm_g_normalization not in {"joint", "per_modality"}:
+            raise ValueError(
+                "scm_g_normalization must be either 'joint' or 'per_modality', "
+                f"got {self.scm_g_normalization!r}"
+            )
+        self.debug_scm_trace = bool(getattr(args, "debug_scm_trace", False))
 
         # DMD latent noise mode for KL gradient computation.
         # "direct_noise": add Gaussian noise at target sigma (standard DMD)
@@ -180,14 +254,22 @@ class LTX2DMD(nn.Module):
         # then subsampled to denoising_step_list by finding the closest sigma.
         # We replicate that logic here so Stage 1/3 DMD training uses the exact
         # same sigma values as the ODE trajectories stored in LMDB.
-        _ode_num_steps = getattr(args, "num_inference_steps", 40)
-        _full_sigmas = LTX2Scheduler().execute(steps=_ode_num_steps)
-        _denoising_sigmas = []
-        for t in args.denoising_step_list:
-            target_sigma = t / 1000.0
-            idx = (_full_sigmas - target_sigma).abs().argmin().item()
-            _denoising_sigmas.append(_full_sigmas[idx])
-        self.denoising_sigmas = torch.stack(_denoising_sigmas).to(device)
+        if self.use_rcm_style_dmd:
+            trig_schedule = torch.tensor(
+                [math.pi / 2, *self.backward_trig_timesteps, 0.0],
+                device=device,
+                dtype=torch.float64,
+            )
+            self.denoising_sigmas = trig_schedule.to(torch.float32)
+        else:
+            _ode_num_steps = getattr(args, "num_inference_steps", 40)
+            _full_sigmas = LTX2Scheduler().execute(steps=_ode_num_steps)
+            _denoising_sigmas = []
+            for t in args.denoising_step_list:
+                target_sigma = t / 1000.0
+                idx = (_full_sigmas - target_sigma).abs().argmin().item()
+                _denoising_sigmas.append(_full_sigmas[idx])
+            self.denoising_sigmas = torch.stack(_denoising_sigmas).to(device)
 
         # Pre-compute sigma lookup table for random timestep → sigma conversion.
         # This matches CausVid's approach where scheduler.add_noise() internally
@@ -234,6 +316,12 @@ class LTX2DMD(nn.Module):
         # Current training step (updated by trainer)
         self.current_step = 0
 
+    def _trace_scm(self, message: str) -> None:
+        if not self.debug_scm_trace:
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[SCMTrace][rank{rank}] {message}", flush=True)
+
     def get_loss_weights(self) -> Tuple[float, float]:
         """Get current video/audio loss weights based on training step."""
         video_w = self.video_loss_weight
@@ -241,6 +329,464 @@ class LTX2DMD(nn.Module):
         if self.audio_start_step > 0 and self.current_step < self.audio_start_step:
             audio_w = 0.0
         return video_w, audio_w
+
+    def _sample_rf_time(self, shape: Tuple[int, ...]) -> torch.Tensor:
+        u = torch.rand(shape, device=self.device, dtype=torch.float64)
+        return shift_rf_time(u, self.dmd_p_D_shift)
+
+    def _sample_scm_rf_time(self, shape: Tuple[int, ...]) -> torch.Tensor:
+        log_sigma = (
+            torch.randn(shape, device=self.device, dtype=torch.float64) * self.scm_p_G_std
+            + self.scm_p_G_mean
+        )
+        sigma = torch.exp(log_sigma)
+        return sigma_to_rf_time(sigma)
+
+    def _sample_dcm_trig_time_list(
+        self, batch_size: int
+    ) -> List[torch.Tensor]:
+        """Sample a short discrete-time interval and return TrigFlow times."""
+        du = 1.0 / float(self.dcm_total_steps)
+        device = self.device
+        u = torch.rand((batch_size, 1), device=device, dtype=torch.float64) * (
+            1.0 - self.dcm_skipping_interval_steps * du
+        )
+
+        trig_t_list: List[torch.Tensor] = []
+        for k in range(self.dcm_skipping_interval_steps + 1):
+            s_k = 1.0 - (u + k * du)
+            rf_t_k = shift_rf_time(s_k, self.dcm_timestep_shift)
+            trig_t_k = rf_to_trig_time(rf_t_k)
+            trig_t_list.append(trig_t_k)
+        return trig_t_list
+
+    @staticmethod
+    def _trig_scaling(trig_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Compute in float64 to match rCM's RectifiedFlow_TrigFlowWrapper precision.
+        # Downstream multiplications with bf16 tensors will auto-upcast.
+        trig_t_64 = trig_t.to(torch.float64)
+        cos_t = torch.cos(trig_t_64)
+        sin_t = torch.sin(trig_t_64)
+        denom = (cos_t + sin_t).clamp_min(1e-8)
+        return cos_t, sin_t, denom
+
+    def _rf_and_trig_time(
+        self, batch_size: int, video_frames: int, audio_frames: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rf_time = self._sample_rf_time((batch_size, 1))
+        trig_time = rf_to_trig_time(rf_time)
+        video_trig = trig_time.to(self.dtype).expand(batch_size, video_frames)
+        audio_trig = trig_time.to(self.dtype).expand(batch_size, audio_frames)
+        return rf_time, trig_time, video_trig, audio_trig
+
+    def _build_rcm_noisy_latents(
+        self,
+        clean_video: torch.Tensor,
+        clean_audio: torch.Tensor,
+        noise_video: torch.Tensor,
+        noise_audio: torch.Tensor,
+        trig_time: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        trig_time_video = trig_time.view(-1, 1, 1, 1, 1)
+        trig_time_audio = trig_time.view(-1, 1, 1)
+        cos_v, sin_v, denom_v = self._trig_scaling(trig_time_video)
+        cos_a, sin_a, denom_a = self._trig_scaling(trig_time_audio)
+
+        trig_video = cos_v * clean_video.double() + sin_v * noise_video.double()
+        trig_audio = cos_a * clean_audio.double() + sin_a * noise_audio.double()
+        return trig_video.to(clean_video.dtype), trig_audio.to(clean_audio.dtype), trig_video, trig_audio
+
+    def _compute_trig_flow_field(
+        self,
+        noisy_latent: torch.Tensor,
+        pred_x0: torch.Tensor,
+        trig_time: torch.Tensor,
+    ) -> torch.Tensor:
+        # Compute sin/cos in float64 for numerical stability, matching rCM.
+        # The final result is cast back to noisy_latent.dtype for downstream use.
+        if noisy_latent.dim() == 5:
+            trig_view = trig_time.view(-1, 1, 1, 1, 1).to(torch.float64)
+        elif noisy_latent.dim() == 3:
+            trig_view = trig_time.view(-1, 1, 1).to(torch.float64)
+        else:
+            raise ValueError(f"Unsupported latent rank for trig flow field: {noisy_latent.dim()}")
+
+        sin_t = torch.sin(trig_view).clamp_min(self.scm_time_eps)
+        cos_t = torch.cos(trig_view)
+        return ((cos_t * noisy_latent.double() - pred_x0.double()) / sin_t).to(noisy_latent.dtype)
+
+    @staticmethod
+    def _cfg_combine(
+        cond_pred: torch.Tensor,
+        uncond_pred: torch.Tensor,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        return cond_pred + (guidance_scale - 1.0) * (cond_pred - uncond_pred)
+
+    def _student_trig_flow_field(
+        self,
+        noisy_video: torch.Tensor,
+        noisy_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+        trig_time: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Run the student on TrigFlow inputs and return flow-field predictions.
+
+        Args:
+            noisy_video: [B, F_v, C, H, W]
+            noisy_audio: [B, F_a, C] or None
+            conditional_dict: Student conditioning dict
+            trig_time: [B, 1] base TrigFlow time
+        """
+        B, F_v = noisy_video.shape[:2]
+        video_trig_time = trig_time.to(self.dtype).expand(B, F_v)
+        audio_trig_time = None
+        if noisy_audio is not None:
+            audio_trig_time = trig_time.to(self.dtype).expand(B, noisy_audio.shape[1])
+
+        student_video_x0, student_audio_x0 = self.generator(
+            noisy_image_or_video=noisy_video,
+            conditional_dict=conditional_dict,
+            timestep=video_trig_time,
+            noisy_audio=noisy_audio,
+            audio_timestep=audio_trig_time,
+        )
+        F_theta_video = self._compute_trig_flow_field(
+            noisy_video,
+            student_video_x0,
+            trig_time,
+        )
+        if noisy_audio is not None:
+            F_theta_audio = self._compute_trig_flow_field(
+                noisy_audio,
+                student_audio_x0,
+                trig_time,
+            )
+        else:
+            F_theta_audio = None
+        return F_theta_video, F_theta_audio
+
+    def _student_trig_flow_jvp(
+        self,
+        noisy_video: torch.Tensor,
+        noisy_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+        trig_time: torch.Tensor,
+        t_noisy_video: torch.Tensor,
+        t_noisy_audio: Optional[torch.Tensor],
+        t_trig_time: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute exact JVP of the student TrigFlow field w.r.t. (x_t, t).
+
+        This mirrors the original rCM `student_F_withT(...)` path, but uses
+        `torch.func.jvp` over the wrapped LTX student instead of a dedicated
+        JVP-aware backbone/kernel. It is slower than the original custom Wan
+        JVP path, but preserves the full SCM training semantics while staying
+        in forward-mode AD rather than the much more memory-hungry autograd
+        fallback.
+        """
+        generator_was_training = self.generator.training
+        self.generator.eval()
+        try:
+            scm_jvp_impl = str(getattr(self, "scm_jvp_impl", "torch_func")).lower()
+            generator_fsdp_jvp_primed = bool(getattr(self, "_generator_fsdp_jvp_primed", False))
+            param_requires_grad_states = None
+            attention_modules = []
+            original_attention_functions = []
+            if scm_jvp_impl != "autograd":
+                for module in self.generator.modules():
+                    if hasattr(module, "attention_function"):
+                        attention_modules.append(module)
+                        original_attention_functions.append(module.attention_function)
+                        module.attention_function = AttentionFunction.PYTORCH
+
+            try:
+                # torch.func.jvp wraps primals as TensorWrapper. FSDP's first-ever
+                # forward performs lazy handle init and tries to inspect tensor
+                # storage, which crashes on TensorWrapper. Prime that lazy init
+                # once with an ordinary no-grad forward before entering JVP mode.
+                if isinstance(self.generator, FSDP) and not generator_fsdp_jvp_primed:
+                    with torch.no_grad():
+                        self._student_trig_flow_field(
+                            noisy_video=noisy_video.detach(),
+                            noisy_audio=noisy_audio.detach() if noisy_audio is not None else None,
+                            conditional_dict=conditional_dict,
+                            trig_time=trig_time.detach(),
+                        )
+                    self._generator_fsdp_jvp_primed = True
+
+                noisy_video_primal = noisy_video.detach()
+                trig_time_primal = trig_time.detach()
+                t_noisy_video_primal = t_noisy_video.detach()
+                t_trig_time_primal = t_trig_time.detach()
+
+                with ExitStack() as stack:
+                    # Even with AttentionFunction.PYTORCH, CUDA SDPA may still
+                    # dispatch to flash/mem-efficient kernels. Force the pure
+                    # math backend during exact JVP.
+                    if scm_jvp_impl != "autograd" and sdpa_kernel is not None and SDPBackend is not None:
+                        stack.enter_context(sdpa_kernel(backends=[SDPBackend.MATH]))
+
+                    if scm_jvp_impl == "internal":
+                        stack.enter_context(torch.no_grad())
+                        B, F_v = noisy_video_primal.shape[:2]
+                        video_trig_time = trig_time_primal.to(self.dtype).expand(B, F_v)
+                        t_video_trig_time = t_trig_time_primal.to(self.dtype).expand(B, F_v)
+                        audio_trig_time = None
+                        t_audio_trig_time = None
+                        if noisy_audio is not None:
+                            audio_trig_time = trig_time_primal.to(self.dtype).expand(B, noisy_audio.shape[1])
+                            t_audio_trig_time = t_trig_time_primal.to(self.dtype).expand(
+                                B, noisy_audio.shape[1]
+                            )
+
+                        (
+                            F_theta_video,
+                            F_theta_audio,
+                            t_F_theta_video,
+                            t_F_theta_audio,
+                        ) = self.generator(
+                            noisy_image_or_video=noisy_video_primal,
+                            conditional_dict=conditional_dict,
+                            timestep=video_trig_time,
+                            noisy_audio=noisy_audio.detach() if noisy_audio is not None else None,
+                            audio_timestep=audio_trig_time,
+                            t_noisy_image_or_video=t_noisy_video_primal,
+                            t_timestep=t_video_trig_time,
+                            t_noisy_audio=t_noisy_audio.detach() if t_noisy_audio is not None else None,
+                            t_audio_timestep=t_audio_trig_time,
+                            with_t=True,
+                        )
+                        F_theta_video = F_theta_video.detach().clone()
+                        t_F_theta_video = t_F_theta_video.detach().clone()
+                        if F_theta_audio is not None:
+                            F_theta_audio = F_theta_audio.detach().clone()
+                        if t_F_theta_audio is not None:
+                            t_F_theta_audio = t_F_theta_audio.detach().clone()
+                    elif scm_jvp_impl == "autograd":
+                        # autograd.functional.jvp only needs derivatives w.r.t.
+                        # the SCM primals/tangents, not model parameters.
+                        # Temporarily disabling parameter gradients avoids
+                        # building a huge reverse-mode graph for generator
+                        # weights and materially lowers memory use.
+                        param_requires_grad_states = []
+                        for param in self.generator.parameters():
+                            param_requires_grad_states.append(param.requires_grad)
+                            if param.requires_grad:
+                                param.requires_grad_(False)
+                        stack.enter_context(torch.enable_grad())
+                    else:
+                        # Keep the tangent/JVP path out of reverse-mode autograd;
+                        # the trainable student forward is computed separately.
+                        stack.enter_context(torch.no_grad())
+
+                    if scm_jvp_impl == "internal":
+                        pass
+                    elif noisy_audio is not None:
+                        noisy_audio_primal = noisy_audio.detach()
+                        t_noisy_audio_primal = t_noisy_audio.detach()
+
+                        if scm_jvp_impl == "autograd":
+                            video_num_chunks = max(
+                                1,
+                                int(
+                                    getattr(
+                                        self,
+                                        "scm_jvp_video_chunks",
+                                        getattr(self, "scm_jvp_num_chunks", 1),
+                                    )
+                                ),
+                            )
+                            audio_num_chunks = max(
+                                1,
+                                int(
+                                    getattr(
+                                        self,
+                                        "scm_jvp_audio_chunks",
+                                        getattr(self, "scm_jvp_num_chunks", 1),
+                                    )
+                                ),
+                            )
+                            offload_chunks_to_cpu = bool(
+                                getattr(self, "scm_jvp_offload_chunks_to_cpu", False)
+                            )
+
+                            # Compute video and audio tangents separately to
+                            # avoid building a single reverse-mode graph whose
+                            # outputs contain both large branches at once.
+                            def _video_flow_fn(video_xt, audio_xt, trig_t):
+                                video_flow, _ = self._student_trig_flow_field(
+                                    noisy_video=video_xt,
+                                    noisy_audio=audio_xt,
+                                    conditional_dict=conditional_dict,
+                                    trig_time=trig_t,
+                                )
+                                return video_flow
+
+                            def _audio_flow_fn(video_xt, audio_xt, trig_t):
+                                _, audio_flow = self._student_trig_flow_field(
+                                    noisy_video=video_xt,
+                                    noisy_audio=audio_xt,
+                                    conditional_dict=conditional_dict,
+                                    trig_time=trig_t,
+                                )
+                                return audio_flow
+
+                            def _chunked_jvp(flow_fn, output_shape, num_chunks):
+                                if num_chunks == 1 and not offload_chunks_to_cpu:
+                                    return torch.autograd.functional.jvp(
+                                        flow_fn,
+                                        (
+                                            noisy_video_primal.requires_grad_(True),
+                                            noisy_audio_primal.requires_grad_(True),
+                                            trig_time_primal.requires_grad_(True),
+                                        ),
+                                        (t_noisy_video_primal, t_noisy_audio_primal, t_trig_time_primal),
+                                        create_graph=False,
+                                        strict=False,
+                                    )
+
+                                flat_dim = math.prod(output_shape[1:])
+                                chunk_size = math.ceil(flat_dim / num_chunks)
+                                storage_device = (
+                                    torch.device("cpu")
+                                    if offload_chunks_to_cpu
+                                    else noisy_video_primal.device
+                                )
+                                flow_full = None
+                                tangent_full = None
+                                for chunk_idx in range(num_chunks):
+                                    start = chunk_idx * chunk_size
+                                    end = min(flat_dim, start + chunk_size)
+                                    if start >= end:
+                                        break
+
+                                    def _flow_chunk_fn(video_xt, audio_xt, trig_t, _start=start, _end=end):
+                                        flow = flow_fn(video_xt, audio_xt, trig_t)
+                                        return flow.reshape(flow.shape[0], -1)[:, _start:_end]
+
+                                    flow_chunk, tangent_chunk = torch.autograd.functional.jvp(
+                                        _flow_chunk_fn,
+                                        (
+                                            noisy_video_primal.requires_grad_(True),
+                                            noisy_audio_primal.requires_grad_(True),
+                                            trig_time_primal.requires_grad_(True),
+                                        ),
+                                        (t_noisy_video_primal, t_noisy_audio_primal, t_trig_time_primal),
+                                        create_graph=False,
+                                        strict=False,
+                                    )
+
+                                    if flow_full is None:
+                                        batch_size = flow_chunk.shape[0]
+                                        flow_full = torch.empty(
+                                            (batch_size, flat_dim),
+                                            device=storage_device,
+                                            dtype=flow_chunk.dtype,
+                                        )
+                                        tangent_full = torch.empty(
+                                            (batch_size, flat_dim),
+                                            device=storage_device,
+                                            dtype=tangent_chunk.dtype,
+                                        )
+
+                                    if offload_chunks_to_cpu:
+                                        flow_full[:, start:end] = flow_chunk.detach().to(
+                                            storage_device, copy=True
+                                        )
+                                        tangent_full[:, start:end] = tangent_chunk.detach().to(
+                                            storage_device, copy=True
+                                        )
+                                    else:
+                                        flow_full[:, start:end] = flow_chunk.detach()
+                                        tangent_full[:, start:end] = tangent_chunk.detach()
+
+                                    del flow_chunk, tangent_chunk
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+
+                                if flow_full is None or tangent_full is None:
+                                    raise RuntimeError("Chunked JVP produced no output chunks")
+
+                                flow_full = flow_full.reshape(output_shape)
+                                tangent_full = tangent_full.reshape(output_shape)
+                                if offload_chunks_to_cpu:
+                                    flow_full = flow_full.to(noisy_video_primal.device)
+                                    tangent_full = tangent_full.to(noisy_video_primal.device)
+                                return flow_full, tangent_full
+
+                            F_theta_video, t_F_theta_video = _chunked_jvp(
+                                _video_flow_fn,
+                                noisy_video_primal.shape,
+                                video_num_chunks,
+                            )
+
+                            F_theta_audio, t_F_theta_audio = _chunked_jvp(
+                                _audio_flow_fn,
+                                noisy_audio_primal.shape,
+                                audio_num_chunks,
+                            )
+                        else:
+                            def _flow_fn(video_xt, audio_xt, trig_t):
+                                return self._student_trig_flow_field(
+                                    noisy_video=video_xt,
+                                    noisy_audio=audio_xt,
+                                    conditional_dict=conditional_dict,
+                                    trig_time=trig_t,
+                                )
+
+                            (F_theta_video, F_theta_audio), (t_F_theta_video, t_F_theta_audio) = torch.func.jvp(
+                                _flow_fn,
+                                (noisy_video_primal, noisy_audio_primal, trig_time_primal),
+                                (t_noisy_video_primal, t_noisy_audio_primal, t_trig_time_primal),
+                            )
+                    elif noisy_audio is None:
+                        def _flow_fn(video_xt, trig_t):
+                            F_theta_video, _ = self._student_trig_flow_field(
+                                noisy_video=video_xt,
+                                noisy_audio=None,
+                                conditional_dict=conditional_dict,
+                                trig_time=trig_t,
+                            )
+                            return F_theta_video
+
+                        if scm_jvp_impl == "autograd":
+                            F_theta_video, t_F_theta_video = torch.autograd.functional.jvp(
+                                _flow_fn,
+                                (
+                                    noisy_video_primal.requires_grad_(True),
+                                    trig_time_primal.requires_grad_(True),
+                                ),
+                                (t_noisy_video_primal, t_trig_time_primal),
+                                create_graph=False,
+                                strict=False,
+                            )
+                        else:
+                            F_theta_video, t_F_theta_video = torch.func.jvp(
+                                _flow_fn,
+                                (noisy_video_primal, trig_time_primal),
+                                (t_noisy_video_primal, t_trig_time_primal),
+                            )
+                        F_theta_audio = None
+                        t_F_theta_audio = None
+            finally:
+                if param_requires_grad_states is not None:
+                    for param, requires_grad in zip(self.generator.parameters(), param_requires_grad_states):
+                        param.requires_grad_(requires_grad)
+                for module, original_attention_function in zip(attention_modules, original_attention_functions):
+                    module.attention_function = original_attention_function
+        finally:
+            if generator_was_training:
+                self.generator.train()
+
+        return (
+            F_theta_video.detach(),
+            F_theta_audio.detach() if F_theta_audio is not None else None,
+            t_F_theta_video.detach(),
+            t_F_theta_audio.detach() if t_F_theta_audio is not None else None,
+        )
 
     def timestep_to_sigma(self, timestep: torch.Tensor) -> torch.Tensor:
         """
@@ -389,7 +935,8 @@ class LTX2DMD(nn.Module):
 
         def _build_bidirectional_delegate(delegate_checkpoint_path: Optional[str] = None):
             _init_log("build bidirectional delegate wrapper start")
-            delegate = create_ltx2_wrapper(
+            wrapper_factory = create_ltx2_trig_wrapper if self.use_rcm_style_dmd else create_ltx2_wrapper
+            delegate = wrapper_factory(
                 checkpoint_path=args.checkpoint_path,
                 gemma_path=args.gemma_path,
                 device=torch.device("cpu"),
@@ -469,7 +1016,8 @@ class LTX2DMD(nn.Module):
                 _init_log("build causal wrapper done")
                 return wrapper
             _init_log("build bidirectional wrapper start")
-            return create_ltx2_wrapper(
+            wrapper_factory = create_ltx2_trig_wrapper if self.use_rcm_style_dmd else create_ltx2_wrapper
+            return wrapper_factory(
                 checkpoint_path=args.checkpoint_path,
                 gemma_path=args.gemma_path,
                 device=self.device,
@@ -487,9 +1035,12 @@ class LTX2DMD(nn.Module):
         _init_log("real_score wrapper init start")
         self.real_score = _build_wrapper(self.real_score_use_causal_wrapper)
         _init_log("real_score wrapper init done")
-        _init_log("fake_score wrapper init start")
-        self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper)
-        _init_log("fake_score wrapper init done")
+        if self.need_fake_score:
+            _init_log("fake_score wrapper init start")
+            self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper)
+            _init_log("fake_score wrapper init done")
+        else:
+            self.fake_score = None
 
         _init_log("text encoder init start")
         self.text_encoder = create_text_encoder_wrapper(
@@ -513,7 +1064,8 @@ class LTX2DMD(nn.Module):
         # Set gradients
         self.generator.set_module_grad(args.generator_grad)
         self.real_score.set_module_grad(args.real_score_grad)
-        self.fake_score.set_module_grad(args.fake_score_grad)
+        if self.fake_score is not None:
+            self.fake_score.set_module_grad(args.fake_score_grad)
         self.text_encoder.requires_grad_(False)
         self.video_vae.requires_grad_(False)
         self.audio_vae.requires_grad_(False)
@@ -521,7 +1073,8 @@ class LTX2DMD(nn.Module):
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
-            self.fake_score.enable_gradient_checkpointing()
+            if self.fake_score is not None:
+                self.fake_score.enable_gradient_checkpointing()
 
         # Checkpoint loading with priority:
         #   resume_checkpoint > generator_ckpt > stage1_ckpt_path
@@ -578,14 +1131,14 @@ class LTX2DMD(nn.Module):
 
             # CausVid-style hybrid setup: only load Stage1 ckpt into fake_score
             # when fake_score itself is causal.
-            if self.fake_score_use_causal_wrapper:
+            if self.fake_score is not None and self.fake_score_use_causal_wrapper:
                 missing_f, unexpected_f = self.fake_score.load_state_dict(gen_sd, strict=stage1_strict)
                 real_missing_f = [k for k in missing_f if "mask_builder" not in k]
                 if real_missing_f:
                     print(f"  [fake_score] missing keys ({len(real_missing_f)}): {real_missing_f[:10]}...")
                 if unexpected_f:
                     print(f"  [fake_score] unexpected keys ({len(unexpected_f)}): {unexpected_f[:10]}...")
-            else:
+            elif self.fake_score is not None:
                 print("[Stage2] fake_score is bidirectional, skip Stage1 causal ckpt load for fake_score")
 
             # Validate sink token shape consistency
@@ -596,7 +1149,7 @@ class LTX2DMD(nn.Module):
                     break
             if sink_key is not None:
                 models_to_check = [("generator", self.generator)]
-                if self.fake_score_use_causal_wrapper:
+                if self.fake_score is not None and self.fake_score_use_causal_wrapper:
                     models_to_check.append(("fake_score", self.fake_score))
                 for name, model in models_to_check:
                     for pname, param in model.named_parameters():
@@ -1617,53 +2170,65 @@ class LTX2DMD(nn.Module):
         F_a = audio_latent.shape[1]
 
         with torch.no_grad():
-            if video_loss_mask is not None and audio_loss_mask is not None:
-                video_timestep, audio_timestep = self._sample_causal_supervision_timesteps(
-                    B,
-                    video_loss_mask,
-                    audio_loss_mask,
-                )
-            else:
-                video_timestep = torch.randint(
-                    0, self.num_train_timestep,
-                    [B, F_v],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                video_timestep = self._process_timestep(video_timestep, self.real_task_type)
-                video_timestep = video_timestep.clamp(self.min_step, self.max_step)
-                audio_timestep = self._compute_audio_timestep(
-                    video_timestep, F_a, task_type=self.real_task_type
-                )
-
-            video_sigma = self.timestep_to_sigma(video_timestep)
-            audio_sigma = self.timestep_to_sigma(audio_timestep)
-
-            if self.dmd_latent_mode == "teacher_denoise":
-                noisy_video, noisy_audio, video_sigma, audio_sigma = \
-                    self._get_noisy_latent_via_teacher_denoise(
-                        clean_video=video_latent,
-                        clean_audio=audio_latent,
-                        target_video_sigma=video_sigma,
-                        target_audio_sigma=audio_sigma,
-                        conditional_dict=conditional_dict,
-                        unconditional_dict=unconditional_dict,
-                    )
-            else:
+            if self.use_rcm_style_dmd:
+                rf_time, trig_time, video_sigma, audio_sigma = self._rf_and_trig_time(B, F_v, F_a)
                 noise_video = torch.randn_like(video_latent)
                 noise_audio = torch.randn_like(audio_latent)
-
-                noisy_video = self.add_noise(
-                    video_latent.flatten(0, 1),
-                    noise_video.flatten(0, 1),
-                    video_sigma.flatten(0, 1),
-                ).unflatten(0, (B, F_v))
-
-                noisy_audio = self.add_noise(
-                    audio_latent,
-                    noise_audio,
-                    audio_sigma,
+                noisy_video, noisy_audio, _, _ = self._build_rcm_noisy_latents(
+                    clean_video=video_latent,
+                    clean_audio=audio_latent,
+                    noise_video=noise_video,
+                    noise_audio=noise_audio,
+                    trig_time=trig_time,
                 )
+            else:
+                if video_loss_mask is not None and audio_loss_mask is not None:
+                    video_timestep, audio_timestep = self._sample_causal_supervision_timesteps(
+                        B,
+                        video_loss_mask,
+                        audio_loss_mask,
+                    )
+                else:
+                    video_timestep = torch.randint(
+                        0, self.num_train_timestep,
+                        [B, F_v],
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    video_timestep = self._process_timestep(video_timestep, self.real_task_type)
+                    video_timestep = video_timestep.clamp(self.min_step, self.max_step)
+                    audio_timestep = self._compute_audio_timestep(
+                        video_timestep, F_a, task_type=self.real_task_type
+                    )
+
+                video_sigma = self.timestep_to_sigma(video_timestep)
+                audio_sigma = self.timestep_to_sigma(audio_timestep)
+
+                if self.dmd_latent_mode == "teacher_denoise":
+                    noisy_video, noisy_audio, video_sigma, audio_sigma = \
+                        self._get_noisy_latent_via_teacher_denoise(
+                            clean_video=video_latent,
+                            clean_audio=audio_latent,
+                            target_video_sigma=video_sigma,
+                            target_audio_sigma=audio_sigma,
+                            conditional_dict=conditional_dict,
+                            unconditional_dict=unconditional_dict,
+                        )
+                else:
+                    noise_video = torch.randn_like(video_latent)
+                    noise_audio = torch.randn_like(audio_latent)
+
+                    noisy_video = self.add_noise(
+                        video_latent.flatten(0, 1),
+                        noise_video.flatten(0, 1),
+                        video_sigma.flatten(0, 1),
+                    ).unflatten(0, (B, F_v))
+
+                    noisy_audio = self.add_noise(
+                        audio_latent,
+                        noise_audio,
+                        audio_sigma,
+                    )
 
             grad_video, grad_audio, log_dict = self._compute_kl_grad(
                 noisy_video=noisy_video,
@@ -1708,8 +2273,608 @@ class LTX2DMD(nn.Module):
         log_dict["audio_loss_weight"] = audio_w
         log_dict["alignment/video_sigma_mean"] = video_sigma.float().mean().item()
         log_dict["alignment/audio_sigma_mean"] = audio_sigma.float().mean().item()
+        if self.use_rcm_style_dmd:
+            log_dict["alignment/video_rf_time_mean"] = rf_time.float().mean().item()
+            log_dict["alignment/audio_rf_time_mean"] = rf_time.float().mean().item()
+            log_dict["alignment/video_trig_time_mean"] = trig_time.float().mean().item()
 
         return total_loss, log_dict
+
+    def compute_scm_loss(
+        self,
+        clean_video: torch.Tensor,
+        clean_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+        unconditional_dict: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Compute faithful sCM loss using real clean latents.
+
+        This follows the original rCM sCM structure, using:
+        - real clean x0 from dataset
+        - p_G time sampling (log-normal in sigma, then rf -> trig)
+        - the fd_type=0 JVP tangent path by default
+        """
+        if not self.use_rcm_style_dmd:
+            raise RuntimeError("SCM requires trig-style DMD/wrapper semantics")
+        if self.scm_strict_rcm and self.scm_fd_type != 0:
+            raise RuntimeError(
+                "Strict rCM SCM requires scm_fd_type=0 (JVP path); "
+                f"got scm_fd_type={self.scm_fd_type}. Set scm_strict_rcm=false "
+                "only for fd_type ablations."
+            )
+        if self.scm_fd_type not in {0, 1, 2}:
+            raise NotImplementedError(
+                f"Unsupported scm_fd_type={self.scm_fd_type}; expected one of 0|1|2"
+            )
+
+        B, F_v = clean_video.shape[:2]
+        has_audio = clean_audio is not None
+        F_a = clean_audio.shape[1] if has_audio else 0
+
+        rf_time = self._sample_scm_rf_time((B, 1))
+        trig_time = rf_to_trig_time(rf_time)
+        min_trig_time = self.scm_fd_size + self.scm_time_eps
+        max_trig_time = (math.pi / 2) - self.scm_time_eps
+        trig_time = trig_time.clamp(min=min_trig_time, max=max_trig_time)
+
+        video_trig_time = trig_time.to(self.dtype).expand(B, F_v)
+        audio_trig_time = trig_time.to(self.dtype).expand(B, F_a) if has_audio else None
+
+        # Compute cos/sin in float64 for numerical stability (matching rCM).
+        # trig_time is already float64 from _sample_scm_rf_time + rf_to_trig_time.
+        trig_time_video_view = trig_time.view(B, 1, 1, 1, 1)
+        cos_t_video = torch.cos(trig_time_video_view)
+        sin_t_video = torch.sin(trig_time_video_view)
+        cs_video = cos_t_video * sin_t_video
+
+        noise_video = torch.randn_like(clean_video)
+        xt_video = (cos_t_video * clean_video.double() + sin_t_video * noise_video.double()).to(clean_video.dtype)
+
+        if has_audio:
+            trig_time_audio_view = trig_time.view(B, 1, 1)
+            cos_t_audio = torch.cos(trig_time_audio_view)
+            sin_t_audio = torch.sin(trig_time_audio_view)
+            cs_audio = cos_t_audio * sin_t_audio
+            noise_audio = torch.randn_like(clean_audio)
+            xt_audio = (cos_t_audio * clean_audio.double() + sin_t_audio * noise_audio.double()).to(clean_audio.dtype)
+        else:
+            cos_t_audio = None
+            sin_t_audio = None
+            cs_audio = None
+            xt_audio = None
+
+        self._trace_scm("teacher_start")
+        with torch.no_grad():
+            teacher_cond_video_x0, teacher_cond_audio_x0 = self.real_score(
+                noisy_image_or_video=xt_video,
+                conditional_dict=conditional_dict,
+                timestep=video_trig_time,
+                noisy_audio=xt_audio,
+                audio_timestep=audio_trig_time,
+            )
+            teacher_uncond_video_x0, teacher_uncond_audio_x0 = self.real_score(
+                noisy_image_or_video=xt_video,
+                conditional_dict=unconditional_dict,
+                timestep=video_trig_time,
+                noisy_audio=xt_audio,
+                audio_timestep=audio_trig_time,
+            )
+
+            teacher_video_x0 = self._cfg_combine(
+                teacher_cond_video_x0,
+                teacher_uncond_video_x0,
+                self.real_video_guidance_scale,
+            )
+            F_teacher_video = self._compute_trig_flow_field(
+                xt_video,
+                teacher_video_x0,
+                trig_time,
+            )
+
+            if has_audio:
+                teacher_audio_x0 = self._cfg_combine(
+                    teacher_cond_audio_x0,
+                    teacher_uncond_audio_x0,
+                    self.real_audio_guidance_scale,
+                )
+                F_teacher_audio = self._compute_trig_flow_field(
+                    xt_audio,
+                    teacher_audio_x0,
+                    trig_time,
+                )
+            else:
+                teacher_audio_x0 = None
+                F_teacher_audio = None
+        self._trace_scm("teacher_done")
+
+        t_xt_video = cs_video * F_teacher_video
+        t_xt_audio = cs_audio * F_teacher_audio if has_audio else None
+        t_trig_time = cs_video.squeeze(dim=[1, 3, 4]).to(trig_time.dtype)
+
+        h = self.scm_fd_size
+        trig_time_prev = (trig_time - h).clamp_min(self.scm_time_eps)
+        cos_h = math.cos(h)
+        sin_h = math.sin(h)
+
+        if self.scm_fd_type == 0:
+            self._trace_scm("jvp_start")
+            (
+                _F_theta_video_jvp,
+                _F_theta_audio_jvp,
+                t_F_theta_video,
+                t_F_theta_audio,
+            ) = self._student_trig_flow_jvp(
+                noisy_video=xt_video,
+                noisy_audio=xt_audio,
+                conditional_dict=conditional_dict,
+                trig_time=trig_time,
+                t_noisy_video=t_xt_video,
+                t_noisy_audio=t_xt_audio,
+                t_trig_time=t_trig_time,
+            )
+            self._trace_scm("jvp_done")
+        elif self.scm_fd_type == 1:
+            (
+                F_theta_video_now,
+                F_theta_audio_now,
+                t_F_theta_video,
+                t_F_theta_audio,
+            ) = self._student_trig_flow_jvp(
+                noisy_video=xt_video,
+                noisy_audio=xt_audio,
+                conditional_dict=conditional_dict,
+                trig_time=trig_time,
+                t_noisy_video=t_xt_video,
+                t_noisy_audio=t_xt_audio,
+                t_trig_time=torch.zeros_like(t_trig_time),
+            )
+            generator_was_training = self.generator.training
+            self.generator.eval()
+            try:
+                with torch.no_grad():
+                    F_theta_video_prev, F_theta_audio_prev = self._student_trig_flow_field(
+                        noisy_video=xt_video,
+                        noisy_audio=xt_audio,
+                        conditional_dict=conditional_dict,
+                        trig_time=trig_time_prev,
+                    )
+            finally:
+                if generator_was_training:
+                    self.generator.train()
+
+            pF_pt_video = (cos_h * F_theta_video_now - F_theta_video_prev) / sin_h
+            t_F_theta_video = t_F_theta_video + cs_video * pF_pt_video
+            if has_audio:
+                pF_pt_audio = (cos_h * F_theta_audio_now - F_theta_audio_prev) / sin_h
+                t_F_theta_audio = t_F_theta_audio + cs_audio * pF_pt_audio
+        else:
+            trig_time_prev = (trig_time - h).clamp_min(self.scm_time_eps)
+            generator_was_training = self.generator.training
+            self.generator.eval()
+            try:
+                with torch.no_grad():
+                    F_theta_video_now, F_theta_audio_now = self._student_trig_flow_field(
+                        noisy_video=xt_video,
+                        noisy_audio=xt_audio,
+                        conditional_dict=conditional_dict,
+                        trig_time=trig_time,
+                    )
+
+                    xt_video_prev = cos_h * xt_video - sin_h * F_teacher_video
+                    xt_audio_prev = cos_h * xt_audio - sin_h * F_teacher_audio if has_audio else None
+                    F_theta_video_prev, F_theta_audio_prev = self._student_trig_flow_field(
+                        noisy_video=xt_video_prev,
+                        noisy_audio=xt_audio_prev,
+                        conditional_dict=conditional_dict,
+                        trig_time=trig_time_prev,
+                    )
+            finally:
+                if generator_was_training:
+                    self.generator.train()
+
+            dF_pt_video = (cos_h * F_theta_video_now - F_theta_video_prev) / sin_h
+            t_F_theta_video = cs_video * dF_pt_video
+            if has_audio:
+                dF_pt_audio = (cos_h * F_theta_audio_now - F_theta_audio_prev) / sin_h
+                t_F_theta_audio = cs_audio * dF_pt_audio
+            else:
+                t_F_theta_audio = None
+
+        video_tangent_abs = torch.mean(
+            torch.abs(t_F_theta_video.detach()),
+            dim=(1, 2, 3, 4),
+            keepdim=True,
+        )
+        video_tangent_raw_mean = video_tangent_abs.mean()
+        video_tangent_reject_mask = torch.zeros(
+            (B, 1, 1, 1, 1),
+            device=t_F_theta_video.device,
+            dtype=torch.bool,
+        )
+        if self.scm_tangent_reject_mean > 0:
+            video_tangent_reject_mask = video_tangent_abs > self.scm_tangent_reject_mean
+        video_tangent_clip_scale = t_F_theta_video.new_tensor(1.0)
+        if self.scm_tangent_clip_mean > 0:
+            video_tangent_scale = (
+                self.scm_tangent_clip_mean
+                / video_tangent_abs.clamp_min(1e-12)
+            ).clamp(max=1.0)
+            t_F_theta_video = t_F_theta_video * video_tangent_scale
+            video_tangent_clip_scale = video_tangent_scale.mean()
+
+        if has_audio:
+            audio_tangent_abs = torch.mean(
+                torch.abs(t_F_theta_audio.detach()),
+                dim=(1, 2),
+                keepdim=True,
+            )
+            audio_tangent_raw_mean = audio_tangent_abs.mean()
+            audio_tangent_reject_mask = torch.zeros(
+                (B, 1, 1),
+                device=t_F_theta_audio.device,
+                dtype=torch.bool,
+            )
+            if self.scm_tangent_reject_mean > 0:
+                audio_tangent_reject_mask = audio_tangent_abs > self.scm_tangent_reject_mean
+            audio_tangent_clip_scale = t_F_theta_audio.new_tensor(1.0)
+            if self.scm_tangent_clip_mean > 0:
+                audio_tangent_scale = (
+                    self.scm_tangent_clip_mean
+                    / audio_tangent_abs.clamp_min(1e-12)
+                ).clamp(max=1.0)
+                t_F_theta_audio = t_F_theta_audio * audio_tangent_scale
+                audio_tangent_clip_scale = audio_tangent_scale.mean()
+        else:
+            audio_tangent_raw_mean = None
+            audio_tangent_clip_scale = None
+            audio_tangent_reject_mask = None
+
+        self._trace_scm("student_forward_start")
+        student_video_x0, student_audio_x0 = self.generator(
+            noisy_image_or_video=xt_video,
+            conditional_dict=conditional_dict,
+            timestep=video_trig_time,
+            noisy_audio=xt_audio,
+            audio_timestep=audio_trig_time,
+        )
+        self._trace_scm("student_forward_done")
+        F_theta_video = self._compute_trig_flow_field(
+            xt_video,
+            student_video_x0,
+            trig_time,
+        )
+        F_theta_video_sg = F_theta_video.detach().clone()
+
+        if has_audio:
+            F_theta_audio = self._compute_trig_flow_field(
+                xt_audio,
+                student_audio_x0,
+                trig_time,
+            )
+            F_theta_audio_sg = F_theta_audio.detach().clone()
+        else:
+            F_theta_audio = None
+            F_theta_audio_sg = None
+
+        warmup_ratio = (
+            1.0
+            if self.scm_tangent_warmup == 0
+            else min(1.0, self.current_step / float(self.scm_tangent_warmup))
+        )
+
+        video_geom_coeff = cos_t_video * torch.sqrt(
+            (1 - warmup_ratio ** 2 * sin_t_video ** 2).clamp_min(0.0)
+        )
+        g_video = -video_geom_coeff * (F_theta_video_sg - F_teacher_video) - (
+            warmup_ratio * cs_video * xt_video + t_F_theta_video
+        )
+
+        if has_audio:
+            audio_geom_coeff = cos_t_audio * torch.sqrt(
+                (1 - warmup_ratio ** 2 * sin_t_audio ** 2).clamp_min(0.0)
+            )
+            g_audio = -audio_geom_coeff * (F_theta_audio_sg - F_teacher_audio) - (
+                warmup_ratio * cs_audio * xt_audio + t_F_theta_audio
+            )
+        else:
+            g_audio = None
+
+        with torch.no_grad():
+            video_nan_mask = (
+                torch.isnan(g_video).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
+                | torch.isnan(F_theta_video).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
+                | video_tangent_reject_mask
+            )
+            if has_audio:
+                audio_nan_mask = (
+                    torch.isnan(g_audio).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
+                    | torch.isnan(F_theta_audio).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
+                    | audio_tangent_reject_mask
+                )
+            else:
+                audio_nan_mask = None
+
+        g_video_pre_norm = g_video.detach()
+        g_video = torch.where(video_nan_mask, torch.zeros_like(g_video), g_video)
+        F_theta_video = torch.where(video_nan_mask, torch.zeros_like(F_theta_video), F_theta_video)
+        F_theta_video_sg = torch.where(video_nan_mask, torch.zeros_like(F_theta_video_sg), F_theta_video_sg)
+
+        if has_audio:
+            g_audio_pre_norm = g_audio.detach()
+            g_audio = torch.where(audio_nan_mask, torch.zeros_like(g_audio), g_audio)
+            F_theta_audio = torch.where(audio_nan_mask, torch.zeros_like(F_theta_audio), F_theta_audio)
+            F_theta_audio_sg = torch.where(audio_nan_mask, torch.zeros_like(F_theta_audio_sg), F_theta_audio_sg)
+        else:
+            g_audio_pre_norm = None
+
+        video_w, audio_w = self.get_loss_weights()
+        active_audio = has_audio and float(audio_w) != 0.0
+
+        if self.scm_g_normalization == "joint":
+            # Optional strict single-state interpretation. In joint AV training
+            # this can let the much larger video tensor dominate the norm, so it
+            # should be used only for explicit ablations.
+            joint_g_norm_sq = g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False)
+            if active_audio:
+                joint_g_norm_sq = joint_g_norm_sq + g_audio.double().square().sum(dim=(1, 2), keepdim=False)
+            video_g_norm = torch.sqrt(joint_g_norm_sq).view(B, 1, 1, 1, 1) + 0.1
+            audio_g_norm = video_g_norm.view(B, 1, 1)
+        else:
+            # Stable AV-SCM path used by 0422_170731: normalize each modality as
+            # its own state so audio/video loss magnitudes stay comparable
+            # despite very different latent dimensionalities.
+            video_g_norm = (
+                torch.sqrt(g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False))
+                .view(B, 1, 1, 1, 1)
+                + 0.1
+            )
+            if active_audio:
+                audio_g_norm = (
+                    torch.sqrt(g_audio.double().square().sum(dim=(1, 2), keepdim=False))
+                    .view(B, 1, 1)
+                    + 0.1
+                )
+            else:
+                audio_g_norm = video_g_norm.view(B, 1, 1)
+
+        g_video = g_video.double() / video_g_norm
+
+        video_loss_scm_per_sample = (
+            (F_theta_video.double() - F_theta_video_sg.double() - g_video) ** 2
+        ).sum(dim=(1, 2, 3, 4))
+
+        if active_audio:
+            g_audio = g_audio.double() / audio_g_norm
+            audio_loss_scm_per_sample = (
+                (F_theta_audio.double() - F_theta_audio_sg.double() - g_audio) ** 2
+            ).sum(dim=(1, 2))
+        else:
+            audio_loss_scm_per_sample = video_loss_scm_per_sample.new_zeros(B)
+
+        video_loss_scm = video_loss_scm_per_sample.mean()
+        audio_loss_scm = audio_loss_scm_per_sample.mean()
+        weighted_scm_loss = (
+            video_w * video_loss_scm_per_sample
+            + audio_w * audio_loss_scm_per_sample
+        ).mean()
+        loss_share_denom = (
+            video_loss_scm_per_sample + audio_loss_scm_per_sample
+        ).clamp_min(1e-12)
+        total_scm_loss = self.scm_loss_scale * weighted_scm_loss.to(clean_video.dtype)
+        self._trace_scm("loss_done")
+
+        log_dict = {
+            "scm_video_loss": video_loss_scm.detach(),
+            "scm_audio_loss": audio_loss_scm.detach() if has_audio else 0.0,
+            "scm_loss_scale": self.scm_loss_scale,
+            "scm_weight": self.scm_weight,
+            "scm_g_normalization_joint": float(self.scm_g_normalization == "joint"),
+            "scm_g_normalization_per_modality": float(
+                self.scm_g_normalization == "per_modality"
+            ),
+            "scm_warmup_ratio": warmup_ratio,
+            "video_loss_weight": video_w,
+            "audio_loss_weight": audio_w,
+            "alignment/scm_rf_time_mean": rf_time.float().mean().item(),
+            "alignment/scm_trig_time_mean": trig_time.float().mean().item(),
+            "alignment/scm_video_teacher_norm": torch.mean(torch.abs(F_teacher_video)).item(),
+            "alignment/scm_video_student_norm": torch.mean(torch.abs(F_theta_video_sg)).item(),
+            "alignment/scm_video_g_norm": torch.mean(torch.abs(g_video_pre_norm)).item(),
+            "alignment/scm_video_g_post_norm": torch.mean(torch.abs(g_video)).item(),
+            "alignment/scm_video_loss_share": torch.mean(
+                video_loss_scm_per_sample / loss_share_denom
+            ).item(),
+            "alignment/scm_video_nan_ratio": video_nan_mask.float().mean().item(),
+            "alignment/scm_video_direction_gap": torch.mean(
+                torch.abs(F_theta_video_sg - F_teacher_video)
+            ).item(),
+            "alignment/scm_video_tangent_norm": torch.mean(
+                torch.abs(t_F_theta_video)
+            ).item(),
+            "alignment/scm_video_tangent_raw_norm": video_tangent_raw_mean.item(),
+            "alignment/scm_video_tangent_clip_scale": video_tangent_clip_scale.item(),
+            "alignment/scm_video_tangent_reject_ratio": video_tangent_reject_mask.float().mean().item(),
+        }
+        if has_audio:
+            log_dict["alignment/scm_audio_teacher_norm"] = torch.mean(torch.abs(F_teacher_audio)).item()
+            log_dict["alignment/scm_audio_student_norm"] = torch.mean(torch.abs(F_theta_audio_sg)).item()
+            log_dict["alignment/scm_audio_g_norm"] = torch.mean(torch.abs(g_audio_pre_norm)).item()
+            log_dict["alignment/scm_audio_g_post_norm"] = torch.mean(torch.abs(g_audio)).item()
+            log_dict["alignment/scm_audio_loss_share"] = torch.mean(
+                audio_loss_scm_per_sample / loss_share_denom
+            ).item()
+            log_dict["alignment/scm_audio_nan_ratio"] = audio_nan_mask.float().mean().item()
+            log_dict["alignment/scm_audio_direction_gap"] = torch.mean(
+                torch.abs(F_theta_audio_sg - F_teacher_audio)
+            ).item()
+            log_dict["alignment/scm_audio_tangent_norm"] = torch.mean(
+                torch.abs(t_F_theta_audio)
+            ).item()
+            log_dict["alignment/scm_audio_tangent_raw_norm"] = audio_tangent_raw_mean.item()
+            log_dict["alignment/scm_audio_tangent_clip_scale"] = audio_tangent_clip_scale.item()
+            log_dict["alignment/scm_audio_tangent_reject_ratio"] = audio_tangent_reject_mask.float().mean().item()
+
+        return total_scm_loss, log_dict
+
+    def compute_dcm_loss(
+        self,
+        clean_video: torch.Tensor,
+        clean_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+        unconditional_dict: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Discrete-time CM (JVP-free) for joint audio-video distillation.
+
+        Student predicts x0 at a noisy start point, teacher rolls that noisy
+        point forward for a short discrete interval, and student predicts x0
+        again at the endpoint. The two student x0 predictions are matched.
+        """
+        B, F_v = clean_video.shape[:2]
+        has_audio = clean_audio is not None
+        F_a = clean_audio.shape[1] if has_audio else 0
+
+        trig_t_list = self._sample_dcm_trig_time_list(B)
+        trig_t0 = trig_t_list[0]
+        trig_tN = trig_t_list[-1]
+
+        trig_t0_video = trig_t0.to(self.dtype).expand(B, F_v)
+        trig_tN_video = trig_tN.to(self.dtype).expand(B, F_v)
+        trig_t0_video_view = trig_t0.view(B, 1, 1, 1, 1)
+
+        noise_video = torch.randn_like(clean_video)
+        xt_video = (
+            torch.cos(trig_t0_video_view).to(clean_video.dtype) * clean_video
+            + torch.sin(trig_t0_video_view).to(clean_video.dtype) * noise_video
+        )
+
+        if has_audio:
+            trig_t0_audio = trig_t0.to(self.dtype).expand(B, F_a)
+            trig_tN_audio = trig_tN.to(self.dtype).expand(B, F_a)
+            trig_t0_audio_view = trig_t0.view(B, 1, 1)
+            noise_audio = torch.randn_like(clean_audio)
+            xt_audio = (
+                torch.cos(trig_t0_audio_view).to(clean_audio.dtype) * clean_audio
+                + torch.sin(trig_t0_audio_view).to(clean_audio.dtype) * noise_audio
+            )
+        else:
+            trig_t0_audio = None
+            trig_tN_audio = None
+            xt_audio = None
+
+        x0_pred_video, x0_pred_audio = self.generator(
+            noisy_image_or_video=xt_video,
+            conditional_dict=conditional_dict,
+            timestep=trig_t0_video,
+            noisy_audio=xt_audio,
+            audio_timestep=trig_t0_audio,
+        )
+
+        with torch.no_grad():
+            xk_video = xt_video
+            xk_audio = xt_audio
+
+            for k in range(self.dcm_skipping_interval_steps):
+                trig_tk = trig_t_list[k]
+                trig_tk1 = trig_t_list[k + 1]
+                dt = (trig_tk - trig_tk1).to(clean_video.dtype)
+                dt_video_view = dt.view(B, 1, 1, 1, 1)
+
+                trig_tk_video = trig_tk.to(self.dtype).expand(B, F_v)
+                if has_audio:
+                    trig_tk_audio = trig_tk.to(self.dtype).expand(B, F_a)
+                else:
+                    trig_tk_audio = None
+
+                teacher_cond_video_x0, teacher_cond_audio_x0 = self.real_score(
+                    noisy_image_or_video=xk_video,
+                    conditional_dict=conditional_dict,
+                    timestep=trig_tk_video,
+                    noisy_audio=xk_audio,
+                    audio_timestep=trig_tk_audio,
+                )
+                teacher_uncond_video_x0, teacher_uncond_audio_x0 = self.real_score(
+                    noisy_image_or_video=xk_video,
+                    conditional_dict=unconditional_dict,
+                    timestep=trig_tk_video,
+                    noisy_audio=xk_audio,
+                    audio_timestep=trig_tk_audio,
+                )
+
+                teacher_video_x0 = self._cfg_combine(
+                    teacher_cond_video_x0,
+                    teacher_uncond_video_x0,
+                    self.real_video_guidance_scale,
+                )
+                F_teacher_video = self._compute_trig_flow_field(
+                    xk_video,
+                    teacher_video_x0,
+                    trig_tk,
+                )
+                xk_video = xk_video - dt_video_view * F_teacher_video
+
+                if has_audio:
+                    teacher_audio_x0 = self._cfg_combine(
+                        teacher_cond_audio_x0,
+                        teacher_uncond_audio_x0,
+                        self.real_audio_guidance_scale,
+                    )
+                    F_teacher_audio = self._compute_trig_flow_field(
+                        xk_audio,
+                        teacher_audio_x0,
+                        trig_tk,
+                    )
+                    dt_audio_view = dt.view(B, 1, 1)
+                    xk_audio = xk_audio - dt_audio_view * F_teacher_audio
+
+            x0_target_video, x0_target_audio = self.generator(
+                noisy_image_or_video=xk_video,
+                conditional_dict=conditional_dict,
+                timestep=trig_tN_video,
+                noisy_audio=xk_audio,
+                audio_timestep=trig_tN_audio,
+            )
+
+        video_loss_dcm = (
+            (x0_pred_video.double() - x0_target_video.double()) ** 2
+        ).sum(dim=(1, 2, 3, 4)).mean()
+        if has_audio:
+            audio_loss_dcm = (
+                (x0_pred_audio.double() - x0_target_audio.double()) ** 2
+            ).sum(dim=(1, 2)).mean()
+        else:
+            audio_loss_dcm = clean_video.new_zeros(())
+
+        video_w, audio_w = self.get_loss_weights()
+        weighted_dcm_loss = video_w * video_loss_dcm + audio_w * audio_loss_dcm
+        total_dcm_loss = self.dcm_loss_scale * weighted_dcm_loss.to(clean_video.dtype)
+
+        log_dict = {
+            "dcm_video_loss": video_loss_dcm.detach(),
+            "dcm_audio_loss": audio_loss_dcm.detach() if has_audio else 0.0,
+            "dcm_loss_scale": self.dcm_loss_scale,
+            "dcm_weight": self.dcm_weight,
+            "alignment/dcm_trig_t0_mean": trig_t0.float().mean().item(),
+            "alignment/dcm_trig_tN_mean": trig_tN.float().mean().item(),
+            "alignment/dcm_video_x0_gap": torch.mean(
+                torch.abs(x0_pred_video.detach() - x0_target_video.detach())
+            ).item(),
+            "alignment/dcm_video_x0_pred_norm": torch.mean(torch.abs(x0_pred_video.detach())).item(),
+            "alignment/dcm_video_x0_target_norm": torch.mean(torch.abs(x0_target_video.detach())).item(),
+        }
+        if has_audio:
+            log_dict["alignment/dcm_audio_x0_gap"] = torch.mean(
+                torch.abs(x0_pred_audio.detach() - x0_target_audio.detach())
+            ).item()
+            log_dict["alignment/dcm_audio_x0_pred_norm"] = torch.mean(
+                torch.abs(x0_pred_audio.detach())
+            ).item()
+            log_dict["alignment/dcm_audio_x0_target_norm"] = torch.mean(
+                torch.abs(x0_target_audio.detach())
+            ).item()
+
+        return total_dcm_loss, log_dict
 
     def _initialize_inference_pipeline(self):
         """Initialize the inference pipeline for backward simulation."""
@@ -1719,6 +2884,7 @@ class LTX2DMD(nn.Module):
             generator=self.generator,
             add_noise_fn=self.add_noise,
             denoising_sigmas=self.denoising_sigmas,
+            use_trigflow=self.use_rcm_style_dmd,
         )
 
     @torch.no_grad()
@@ -1837,12 +3003,22 @@ class LTX2DMD(nn.Module):
                 sigma_tensor_a = sigma * torch.ones([B, F_a], device=self.device)
 
                 if sigma > 0:
-                    noisy_video = self.add_noise(
-                        clean_video.flatten(0, 1),
-                        noise_v.flatten(0, 1),
-                        sigma_tensor.flatten(0, 1),
-                    ).unflatten(0, (B, F_v))
-                    noisy_audio = self.add_noise(clean_audio, noise_a, sigma_tensor_a)
+                    if self.use_rcm_style_dmd:
+                        noisy_video = (
+                            torch.cos(sigma).to(clean_video.dtype) * clean_video
+                            + torch.sin(sigma).to(clean_video.dtype) * noise_v
+                        )
+                        noisy_audio = (
+                            torch.cos(sigma).to(clean_audio.dtype) * clean_audio
+                            + torch.sin(sigma).to(clean_audio.dtype) * noise_a
+                        )
+                    else:
+                        noisy_video = self.add_noise(
+                            clean_video.flatten(0, 1),
+                            noise_v.flatten(0, 1),
+                            sigma_tensor.flatten(0, 1),
+                        ).unflatten(0, (B, F_v))
+                        noisy_audio = self.add_noise(clean_audio, noise_a, sigma_tensor_a)
                 else:
                     noisy_video = clean_video
                     noisy_audio = clean_audio
@@ -1908,13 +3084,17 @@ class LTX2DMD(nn.Module):
         self,
         video_shape: List[int],
         audio_shape: List[int],
-        conditional_dict: Dict[str, Any],
-        unconditional_dict: Dict[str, Any],
+        conditional_dict: Optional[Dict[str, Any]],
+        unconditional_dict: Optional[Dict[str, Any]],
         clean_video: Optional[torch.Tensor] = None,
         clean_audio: Optional[torch.Tensor] = None,
+        scm_clean_video: Optional[torch.Tensor] = None,
+        scm_clean_audio: Optional[torch.Tensor] = None,
+        scm_conditional_dict: Optional[Dict[str, Any]] = None,
+        scm_unconditional_dict: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Compute generator loss using DMD.
+        Compute generator loss using DMD and optional SCM.
 
         Args:
             video_shape: [B, F, C, H, W]
@@ -1923,31 +3103,88 @@ class LTX2DMD(nn.Module):
             unconditional_dict: Unconditional embeddings
             clean_video: Clean video latent (optional, for non-backward-simulation)
             clean_audio: Clean audio latent (optional)
+            scm_clean_video: Real clean video latent for faithful SCM
+            scm_clean_audio: Real clean audio latent for faithful SCM
+            scm_conditional_dict: Conditional embeddings for SCM real data
+            scm_unconditional_dict: Unconditional embeddings for SCM real data
 
         Returns:
             Tuple of (loss, log_dict)
         """
-        # Run generator
-        pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = self._run_generator(
-            video_shape=video_shape,
-            audio_shape=audio_shape,
-            conditional_dict=conditional_dict,
-            clean_video=clean_video,
-            clean_audio=clean_audio,
-        )
+        if not self.dmd_enabled and not self.scm_enabled and not self.dcm_enabled:
+            raise ValueError("At least one of dmd_enabled/scm_enabled/dcm_enabled must be true")
 
-        # Compute DMD loss
-        dmd_loss, log_dict = self.compute_distribution_matching_loss(
-            video_latent=pred_video,
-            audio_latent=pred_audio,
-            conditional_dict=conditional_dict,
-            unconditional_dict=unconditional_dict,
-            video_loss_mask=video_loss_mask,
-            audio_loss_mask=audio_loss_mask,
-        )
-        log_dict.update(rollout_log)
+        log_dict: Dict[str, Any] = {}
+        total_loss: Optional[torch.Tensor] = None
 
-        return dmd_loss, log_dict
+        if self.dmd_enabled:
+            if conditional_dict is None or unconditional_dict is None:
+                raise ValueError("DMD is enabled but DMD text conditions were not provided")
+
+            pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = self._run_generator(
+                video_shape=video_shape,
+                audio_shape=audio_shape,
+                conditional_dict=conditional_dict,
+                clean_video=clean_video,
+                clean_audio=clean_audio,
+            )
+
+            dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
+                video_latent=pred_video,
+                audio_latent=pred_audio,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                video_loss_mask=video_loss_mask,
+                audio_loss_mask=audio_loss_mask,
+            )
+            log_dict.update(rollout_log)
+            log_dict.update(dmd_log_dict)
+            total_loss = dmd_loss
+            log_dict["generator_dmd_loss"] = dmd_loss.detach()
+        else:
+            log_dict["generator_dmd_loss"] = torch.tensor(0.0, device=self.device)
+
+        if self.scm_enabled:
+            if scm_clean_video is None or scm_conditional_dict is None or scm_unconditional_dict is None:
+                raise ValueError(
+                    "SCM is enabled but SCM clean latents / text conditions were not provided"
+                )
+            scm_loss, scm_log_dict = self.compute_scm_loss(
+                clean_video=scm_clean_video,
+                clean_audio=scm_clean_audio,
+                conditional_dict=scm_conditional_dict,
+                unconditional_dict=scm_unconditional_dict,
+            )
+            total_loss = (
+                self.scm_weight * scm_loss
+                if total_loss is None
+                else total_loss + self.scm_weight * scm_loss
+            )
+            log_dict.update(scm_log_dict)
+            log_dict["generator_total_loss"] = total_loss.detach()
+        if self.dcm_enabled:
+            if scm_clean_video is None or scm_conditional_dict is None or scm_unconditional_dict is None:
+                raise ValueError(
+                    "DCM is enabled but clean latents / text conditions were not provided"
+                )
+            dcm_loss, dcm_log_dict = self.compute_dcm_loss(
+                clean_video=scm_clean_video,
+                clean_audio=scm_clean_audio,
+                conditional_dict=scm_conditional_dict,
+                unconditional_dict=scm_unconditional_dict,
+            )
+            total_loss = (
+                self.dcm_weight * dcm_loss
+                if total_loss is None
+                else total_loss + self.dcm_weight * dcm_loss
+            )
+            log_dict.update(dcm_log_dict)
+            log_dict["generator_total_loss"] = total_loss.detach()
+
+        if not self.scm_enabled and not self.dcm_enabled:
+            log_dict["generator_total_loss"] = total_loss.detach()
+
+        return total_loss, log_dict
 
     def critic_loss(
         self,
@@ -1977,8 +3214,10 @@ class LTX2DMD(nn.Module):
         F_v = generated_video.shape[1]
         F_a = generated_audio.shape[1]
 
-        # Step 2: Sample critic timestep
-        if video_loss_mask is not None and audio_loss_mask is not None:
+        # Step 2: Sample critic timestep / supervision time
+        if self.use_rcm_style_dmd:
+            rf_time, trig_time, critic_sigma, audio_critic_sigma = self._rf_and_trig_time(B, F_v, F_a)
+        elif video_loss_mask is not None and audio_loss_mask is not None:
             critic_timestep, audio_critic_timestep = self._sample_causal_supervision_timesteps(
                 B,
                 video_loss_mask,
@@ -2010,15 +3249,24 @@ class LTX2DMD(nn.Module):
         noise_video = torch.randn_like(generated_video)
         noise_audio = torch.randn_like(generated_audio)
 
-        noisy_generated_video = self.add_noise(
-            generated_video.flatten(0, 1),
-            noise_video.flatten(0, 1),
-            critic_sigma.flatten(0, 1),
-        ).unflatten(0, (B, F_v))
+        if self.use_rcm_style_dmd:
+            noisy_generated_video, noisy_generated_audio, _, _ = self._build_rcm_noisy_latents(
+                clean_video=generated_video,
+                clean_audio=generated_audio,
+                noise_video=noise_video,
+                noise_audio=noise_audio,
+                trig_time=trig_time,
+            )
+        else:
+            noisy_generated_video = self.add_noise(
+                generated_video.flatten(0, 1),
+                noise_video.flatten(0, 1),
+                critic_sigma.flatten(0, 1),
+            ).unflatten(0, (B, F_v))
 
-        noisy_generated_audio = self.add_noise(
-            generated_audio, noise_audio, audio_critic_sigma
-        )
+            noisy_generated_audio = self.add_noise(
+                generated_audio, noise_audio, audio_critic_sigma
+            )
 
         # Step 4: Critic prediction
         pred_video, pred_audio = self.fake_score(
@@ -2029,41 +3277,58 @@ class LTX2DMD(nn.Module):
             audio_timestep=audio_critic_sigma,
         )
 
-        # Step 5: Compute flow matching loss for critic
-        # CausVid uses flow_pred = (xt - x0_pred) / sigma, NOT simple x0 MSE.
-        # The 1/sigma factor gives implicit 1/sigma^2 gradient weighting,
-        # making the critic accurate at low-noise timesteps (critical for DMD).
-        # Float64 for numerical stability, then cast back (matches CausVid).
-        video_sigma_4d = critic_sigma.flatten(0, 1).double().reshape(-1, 1, 1, 1).clamp_min(1e-8)
-        flow_pred_video = (
-            (noisy_generated_video.flatten(0, 1).double() - pred_video.flatten(0, 1).double())
-            / video_sigma_4d
-        ).to(self.dtype)
+        if self.use_rcm_style_dmd:
+            inv_sin_sq = (
+                1.0 / torch.sin(trig_time.double()).pow(2).clamp_min(1e-4)
+            ).to(generated_video.dtype)
+            video_per_frame = (generated_video.double() - pred_video.double()).pow(2).mean(dim=[2, 3, 4])
+            audio_per_frame = (generated_audio.double() - pred_audio.double()).pow(2).mean(dim=2)
+            video_loss = self._masked_weighted_mean(
+                video_per_frame,
+                inv_sin_sq.expand(B, F_v),
+                video_loss_mask,
+            ).to(generated_video.dtype)
+            audio_loss = self._masked_weighted_mean(
+                audio_per_frame,
+                inv_sin_sq.expand(B, F_a),
+                audio_loss_mask,
+            ).to(generated_audio.dtype)
+        else:
+            # Step 5: Compute flow matching loss for critic
+            # CausVid uses flow_pred = (xt - x0_pred) / sigma, NOT simple x0 MSE.
+            # The 1/sigma factor gives implicit 1/sigma^2 gradient weighting,
+            # making the critic accurate at low-noise timesteps (critical for DMD).
+            # Float64 for numerical stability, then cast back (matches CausVid).
+            video_sigma_4d = critic_sigma.flatten(0, 1).double().reshape(-1, 1, 1, 1).clamp_min(1e-8)
+            flow_pred_video = (
+                (noisy_generated_video.flatten(0, 1).double() - pred_video.flatten(0, 1).double())
+                / video_sigma_4d
+            ).to(self.dtype)
 
-        audio_sigma_2d = audio_critic_sigma.double().unsqueeze(-1).clamp_min(1e-8)
-        flow_pred_audio = (
-            (noisy_generated_audio.double() - pred_audio.double())
-            / audio_sigma_2d
-        ).to(self.dtype)
+            audio_sigma_2d = audio_critic_sigma.double().unsqueeze(-1).clamp_min(1e-8)
+            flow_pred_audio = (
+                (noisy_generated_audio.double() - pred_audio.double())
+                / audio_sigma_2d
+            ).to(self.dtype)
 
-        # flow_true = noise - x0 (target flow)
-        video_loss = self._compute_masked_denoising_loss(
-            target=generated_video,
-            prediction=pred_video,
-            noise=noise_video,
-            flow_pred=flow_pred_video.unflatten(0, (B, F_v)),
-            timestep=critic_timestep,
-            mask=video_loss_mask,
-        )
+            # flow_true = noise - x0 (target flow)
+            video_loss = self._compute_masked_denoising_loss(
+                target=generated_video,
+                prediction=pred_video,
+                noise=noise_video,
+                flow_pred=flow_pred_video.unflatten(0, (B, F_v)),
+                timestep=critic_timestep,
+                mask=video_loss_mask,
+            )
 
-        audio_loss = self._compute_masked_denoising_loss(
-            target=generated_audio,
-            prediction=pred_audio,
-            noise=noise_audio,
-            flow_pred=flow_pred_audio,
-            timestep=audio_critic_timestep,
-            mask=audio_loss_mask,
-        )
+            audio_loss = self._compute_masked_denoising_loss(
+                target=generated_audio,
+                prediction=pred_audio,
+                noise=noise_audio,
+                flow_pred=flow_pred_audio,
+                timestep=audio_critic_timestep,
+                mask=audio_loss_mask,
+            )
 
         video_w, audio_w = self.get_loss_weights()
         total_loss = video_w * video_loss + audio_w * audio_loss
@@ -2072,5 +3337,8 @@ class LTX2DMD(nn.Module):
             "critic_video_loss": video_loss.item(),
             "critic_audio_loss": audio_loss.item(),
         }
+        if self.use_rcm_style_dmd:
+            log_dict["critic_trig_time_mean"] = trig_time.float().mean().item()
+            log_dict["critic_rf_time_mean"] = rf_time.float().mean().item()
 
         return total_loss, log_dict
