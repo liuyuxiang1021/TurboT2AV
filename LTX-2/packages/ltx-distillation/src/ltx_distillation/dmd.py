@@ -487,15 +487,16 @@ class LTX2DMD(nn.Module):
         in forward-mode AD rather than the much more memory-hungry autograd
         fallback.
         """
+        scm_jvp_impl = str(getattr(self, "scm_jvp_impl", "torch_func")).lower()
         generator_was_training = self.generator.training
-        self.generator.eval()
+        if scm_jvp_impl != "internal":
+            self.generator.eval()
         try:
-            scm_jvp_impl = str(getattr(self, "scm_jvp_impl", "torch_func")).lower()
             generator_fsdp_jvp_primed = bool(getattr(self, "_generator_fsdp_jvp_primed", False))
             param_requires_grad_states = None
             attention_modules = []
             original_attention_functions = []
-            if scm_jvp_impl != "autograd":
+            if scm_jvp_impl not in ("autograd", "internal"):
                 for module in self.generator.modules():
                     if hasattr(module, "attention_function"):
                         attention_modules.append(module)
@@ -526,7 +527,7 @@ class LTX2DMD(nn.Module):
                     # Even with AttentionFunction.PYTORCH, CUDA SDPA may still
                     # dispatch to flash/mem-efficient kernels. Force the pure
                     # math backend during exact JVP.
-                    if scm_jvp_impl != "autograd" and sdpa_kernel is not None and SDPBackend is not None:
+                    if scm_jvp_impl not in ("autograd", "internal") and sdpa_kernel is not None and SDPBackend is not None:
                         stack.enter_context(sdpa_kernel(backends=[SDPBackend.MATH]))
 
                     if scm_jvp_impl == "internal":
