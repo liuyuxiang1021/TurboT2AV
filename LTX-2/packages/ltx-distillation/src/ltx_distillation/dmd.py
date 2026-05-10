@@ -229,9 +229,9 @@ class LTX2DMD(nn.Module):
         self.scm_g_normalization = str(
             getattr(args, "scm_g_normalization", "per_modality")
         ).lower()
-        if self.scm_g_normalization not in {"joint", "per_modality"}:
+        if self.scm_g_normalization not in {"joint", "per_modality", "per_frame"}:
             raise ValueError(
-                "scm_g_normalization must be either 'joint' or 'per_modality', "
+                "scm_g_normalization must be 'joint', 'per_modality', or 'per_frame', "
                 f"got {self.scm_g_normalization!r}"
             )
         self.debug_scm_trace = bool(getattr(args, "debug_scm_trace", False))
@@ -2612,18 +2612,27 @@ class LTX2DMD(nn.Module):
         active_audio = has_audio and float(audio_w) != 0.0
 
         if self.scm_g_normalization == "joint":
-            # Optional strict single-state interpretation. In joint AV training
-            # this can let the much larger video tensor dominate the norm, so it
-            # should be used only for explicit ablations.
             joint_g_norm_sq = g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False)
             if active_audio:
                 joint_g_norm_sq = joint_g_norm_sq + g_audio.double().square().sum(dim=(1, 2), keepdim=False)
             video_g_norm = torch.sqrt(joint_g_norm_sq).view(B, 1, 1, 1, 1) + 0.1
             audio_g_norm = video_g_norm.view(B, 1, 1)
+        elif self.scm_g_normalization == "per_frame":
+            T_vid = g_video.shape[2]
+            video_g_norm = (
+                torch.sqrt(g_video.double().square().sum(dim=(1, 3, 4), keepdim=False))
+                .view(B, 1, T_vid, 1, 1)
+                + 0.1
+            )
+            if active_audio:
+                audio_g_norm = (
+                    torch.sqrt(g_audio.double().square().sum(dim=(1, 2), keepdim=False))
+                    .view(B, 1, 1)
+                    + 0.1
+                )
+            else:
+                audio_g_norm = video_g_norm.mean(dim=2, keepdim=True).view(B, 1, 1)
         else:
-            # Stable AV-SCM path used by 0422_170731: normalize each modality as
-            # its own state so audio/video loss magnitudes stay comparable
-            # despite very different latent dimensionalities.
             video_g_norm = (
                 torch.sqrt(g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False))
                 .view(B, 1, 1, 1, 1)
@@ -2672,6 +2681,9 @@ class LTX2DMD(nn.Module):
             "scm_g_normalization_joint": float(self.scm_g_normalization == "joint"),
             "scm_g_normalization_per_modality": float(
                 self.scm_g_normalization == "per_modality"
+            ),
+            "scm_g_normalization_per_frame": float(
+                self.scm_g_normalization == "per_frame"
             ),
             "scm_warmup_ratio": warmup_ratio,
             "video_loss_weight": video_w,
