@@ -2532,18 +2532,13 @@ class LTX2DMD(nn.Module):
             audio_tangent_reject_mask = None
 
         self._trace_scm("student_forward_start")
-        if sdpa_kernel is not None and SDPBackend is not None:
-            _sdpa_ctx = sdpa_kernel(backends=[SDPBackend.MATH])
-        else:
-            _sdpa_ctx = nullcontext()
-        with _sdpa_ctx:
-            student_video_x0, student_audio_x0 = self.generator(
-                noisy_image_or_video=xt_video,
-                conditional_dict=conditional_dict,
-                timestep=video_trig_time,
-                noisy_audio=xt_audio,
-                audio_timestep=audio_trig_time,
-            )
+        student_video_x0, student_audio_x0 = self.generator(
+            noisy_image_or_video=xt_video,
+            conditional_dict=conditional_dict,
+            timestep=video_trig_time,
+            noisy_audio=xt_audio,
+            audio_timestep=audio_trig_time,
+        )
         self._trace_scm("student_forward_done")
         F_theta_video = self._compute_trig_flow_field(
             xt_video,
