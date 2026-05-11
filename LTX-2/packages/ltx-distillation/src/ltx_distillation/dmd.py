@@ -531,6 +531,7 @@ class LTX2DMD(nn.Module):
                         stack.enter_context(sdpa_kernel(backends=[SDPBackend.MATH]))
 
                     if scm_jvp_impl == "internal":
+                        stack.enter_context(torch.no_grad())
                         B, F_v = noisy_video_primal.shape[:2]
                         video_trig_time = trig_time_primal.to(self.dtype).expand(B, F_v)
                         t_video_trig_time = t_trig_time_primal.to(self.dtype).expand(B, F_v)
@@ -559,7 +560,10 @@ class LTX2DMD(nn.Module):
                             t_audio_timestep=t_audio_trig_time,
                             with_t=True,
                         )
+                        F_theta_video = F_theta_video.detach().clone()
                         t_F_theta_video = t_F_theta_video.detach().clone()
+                        if F_theta_audio is not None:
+                            F_theta_audio = F_theta_audio.detach().clone()
                         if t_F_theta_audio is not None:
                             t_F_theta_audio = t_F_theta_audio.detach().clone()
                     elif scm_jvp_impl == "autograd":
@@ -778,13 +782,6 @@ class LTX2DMD(nn.Module):
             if generator_was_training:
                 self.generator.train()
 
-        if scm_jvp_impl == "internal":
-            return (
-                F_theta_video,
-                F_theta_audio,
-                t_F_theta_video,
-                t_F_theta_audio,
-            )
         return (
             F_theta_video.detach(),
             F_theta_audio.detach() if F_theta_audio is not None else None,
@@ -2534,48 +2531,32 @@ class LTX2DMD(nn.Module):
             audio_tangent_clip_scale = None
             audio_tangent_reject_mask = None
 
-        # fd_type=0 discards JVP F_theta (_F_theta_video_jvp) and uses a
-        # separate forward for gradient consistency.  fd_type=1 also runs
-        # its own separate eval forward later.  For internal JVP we reuse
-        # the primal from the JVP call itself (single forward = consistent
-        # attention/SDPA path).  See PR discussion re SDPBackend.MATH.
-        if self.scm_fd_type == 0 and scm_jvp_impl == "internal":
-            self._trace_scm("student_forward_reuse_jvp")
-            F_theta_video = _F_theta_video_jvp
-            F_theta_video_sg = F_theta_video.detach().clone()
-            if has_audio:
-                F_theta_audio = _F_theta_audio_jvp
-                F_theta_audio_sg = F_theta_audio.detach().clone()
-            else:
-                F_theta_audio = None
-                F_theta_audio_sg = None
-        else:
-            self._trace_scm("student_forward_start")
-            student_video_x0, student_audio_x0 = self.generator(
-                noisy_image_or_video=xt_video,
-                conditional_dict=conditional_dict,
-                timestep=video_trig_time,
-                noisy_audio=xt_audio,
-                audio_timestep=audio_trig_time,
-            )
-            self._trace_scm("student_forward_done")
-            F_theta_video = self._compute_trig_flow_field(
-                xt_video,
-                student_video_x0,
+        self._trace_scm("student_forward_start")
+        student_video_x0, student_audio_x0 = self.generator(
+            noisy_image_or_video=xt_video,
+            conditional_dict=conditional_dict,
+            timestep=video_trig_time,
+            noisy_audio=xt_audio,
+            audio_timestep=audio_trig_time,
+        )
+        self._trace_scm("student_forward_done")
+        F_theta_video = self._compute_trig_flow_field(
+            xt_video,
+            student_video_x0,
+            trig_time,
+        )
+        F_theta_video_sg = F_theta_video.detach().clone()
+
+        if has_audio:
+            F_theta_audio = self._compute_trig_flow_field(
+                xt_audio,
+                student_audio_x0,
                 trig_time,
             )
-            F_theta_video_sg = F_theta_video.detach().clone()
-
-            if has_audio:
-                F_theta_audio = self._compute_trig_flow_field(
-                    xt_audio,
-                    student_audio_x0,
-                    trig_time,
-                )
-                F_theta_audio_sg = F_theta_audio.detach().clone()
-            else:
-                F_theta_audio = None
-                F_theta_audio_sg = None
+            F_theta_audio_sg = F_theta_audio.detach().clone()
+        else:
+            F_theta_audio = None
+            F_theta_audio_sg = None
 
         warmup_ratio = (
             1.0
