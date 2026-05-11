@@ -115,25 +115,26 @@ def _attention_with_t(
     k_pe: torch.Tensor | None,
 ):
     attention = _unwrap_fsdp(attention)
-    if context is None:
-        return _single_input_jvp(
-            lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        if context is None:
+            return _single_input_jvp(
+                lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
+                x,
+                t_x,
+            )
+        if t_context is None:
+            return _single_input_jvp(
+                lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
+                x,
+                t_x,
+            )
+        return _two_input_jvp(
+            lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
             x,
+            context,
             t_x,
+            t_context,
         )
-    if t_context is None:
-        return _single_input_jvp(
-            lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-            x,
-            t_x,
-        )
-    return _two_input_jvp(
-        lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-        x,
-        context,
-        t_x,
-        t_context,
-    )
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
