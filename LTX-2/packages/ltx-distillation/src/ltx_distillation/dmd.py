@@ -160,8 +160,15 @@ class LTX2DMD(nn.Module):
                 "only last_block is currently supported"
             )
 
+        # EMA (exponential moving average) for generator — critical for inference quality
+        self.ema_enabled = bool(getattr(args, "ema_enabled", False))
+        self.ema_rate = float(getattr(args, "ema_rate", 0.1))
+        self.ema_iteration_shift = int(getattr(args, "ema_iteration_shift", 0))
+
         # Initialize models (will be populated by _init_models or external loading)
         self.generator: LTX2DiffusionWrapper = None
+        self.generator_ema = None  # Placeholder; EMA is stored as state_dict
+        self._ema_state_dict: dict | None = None  # Lightweight EMA state_dict on CPU
         self.real_score: LTX2DiffusionWrapper = None
         self.fake_score: LTX2DiffusionWrapper = None
         self.text_encoder: GemmaTextEncoderWrapper = None
@@ -192,7 +199,7 @@ class LTX2DMD(nn.Module):
         )
         self.dcm_timestep_shift = float(getattr(args, "dcm_timestep_shift", 5.0))
         # Align SCM time sampling with the original rCM implementation.
-        self.scm_p_G_mean = float(getattr(args, "scm_p_G_mean", 0.7))
+        self.scm_p_G_mean = float(getattr(args, "scm_p_G_mean", -0.8))
         self.scm_p_G_std = float(getattr(args, "scm_p_G_std", 1.6))
         # fd_type semantics from the original rCM code:
         #   0 -> SCM JVP path
@@ -375,8 +382,8 @@ class LTX2DMD(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rf_time = self._sample_rf_time((batch_size, 1))
         trig_time = rf_to_trig_time(rf_time)
-        video_trig = trig_time.to(self.dtype).expand(batch_size, video_frames)
-        audio_trig = trig_time.to(self.dtype).expand(batch_size, audio_frames)
+        video_trig = trig_time.to(torch.float32).expand(batch_size, video_frames)
+        audio_trig = trig_time.to(torch.float32).expand(batch_size, audio_frames)
         return rf_time, trig_time, video_trig, audio_trig
 
     def _build_rcm_noisy_latents(
@@ -440,10 +447,10 @@ class LTX2DMD(nn.Module):
             trig_time: [B, 1] base TrigFlow time
         """
         B, F_v = noisy_video.shape[:2]
-        video_trig_time = trig_time.to(self.dtype).expand(B, F_v)
+        video_trig_time = trig_time.to(torch.float32).expand(B, F_v)
         audio_trig_time = None
         if noisy_audio is not None:
-            audio_trig_time = trig_time.to(self.dtype).expand(B, noisy_audio.shape[1])
+            audio_trig_time = trig_time.to(torch.float32).expand(B, noisy_audio.shape[1])
 
         student_video_x0, student_audio_x0 = self.generator(
             noisy_image_or_video=noisy_video,
@@ -533,13 +540,13 @@ class LTX2DMD(nn.Module):
                     if scm_jvp_impl == "internal":
                         stack.enter_context(torch.no_grad())
                         B, F_v = noisy_video_primal.shape[:2]
-                        video_trig_time = trig_time_primal.to(self.dtype).expand(B, F_v)
-                        t_video_trig_time = t_trig_time_primal.to(self.dtype).expand(B, F_v)
+                        video_trig_time = trig_time_primal.to(torch.float32).expand(B, F_v)
+                        t_video_trig_time = t_trig_time_primal.to(torch.float32).expand(B, F_v)
                         audio_trig_time = None
                         t_audio_trig_time = None
                         if noisy_audio is not None:
-                            audio_trig_time = trig_time_primal.to(self.dtype).expand(B, noisy_audio.shape[1])
-                            t_audio_trig_time = t_trig_time_primal.to(self.dtype).expand(
+                            audio_trig_time = trig_time_primal.to(torch.float32).expand(B, noisy_audio.shape[1])
+                            t_audio_trig_time = t_trig_time_primal.to(torch.float32).expand(
                                 B, noisy_audio.shape[1]
                             )
 
@@ -1033,6 +1040,10 @@ class LTX2DMD(nn.Module):
         _init_log("generator wrapper init start")
         self.generator = _build_wrapper(self.generator_use_causal_wrapper)
         _init_log("generator wrapper init done")
+        if self.ema_enabled:
+            _init_log("generator ema init (state_dict on CPU, lazy)")
+            self._ema_state_dict = None  # Will be populated on first update_ema()
+            _init_log("generator ema init done")
         _init_log("real_score wrapper init start")
         self.real_score = _build_wrapper(self.real_score_use_causal_wrapper)
         _init_log("real_score wrapper init done")
@@ -1161,6 +1172,40 @@ class LTX2DMD(nn.Module):
                             )
                             break
             print("[Stage2] Stage1 checkpoint load complete")
+
+    def ema_beta(self, iteration: int) -> float:
+        """rCM-style power-schedule EMA decay. Returns 0 for first step, asymptotically → 1."""
+        if not self.ema_enabled:
+            return 1.0
+        iteration = iteration + self.ema_iteration_shift
+        if iteration < 1:
+            return 0.0
+        # Power schedule: beta = (1 - 1/(iter+1))^(exp_coeff+1) where exp_coeff comes from rCM
+        # For ema_rate=0.1: exp_coeff ≈ roots([1, 7, 16 - 1/s², 12 - 1/s²]).real.max()
+        import numpy as np
+        s = self.ema_rate
+        exp_coeff = np.roots([1, 7, 16 - s**(-2), 12 - s**(-2)]).real.max()
+        return (1 - 1 / (iteration + 1)) ** (exp_coeff + 1)
+
+    @torch.no_grad()
+    def update_ema(self, iteration: int):
+        """Update EMA as lightweight state_dict on CPU (no full model copy needed)."""
+        if not self.ema_enabled:
+            return
+        beta = self.ema_beta(iteration)
+        gen_sd = self.generator.state_dict()  # gathers FSDP-sharded params
+        gen_sd_cpu = {k: v.cpu() for k, v in gen_sd.items()}
+        if not hasattr(self, '_ema_state_dict') or self._ema_state_dict is None:
+            self._ema_state_dict = gen_sd_cpu  # First call: lazy init
+        else:
+            for k in self._ema_state_dict:
+                if k in gen_sd_cpu:
+                    self._ema_state_dict[k].data.mul_(beta).add_(gen_sd_cpu[k].data, alpha=1 - beta)
+        del gen_sd, gen_sd_cpu
+
+    def ema_state_dict(self) -> dict | None:
+        """Return the EMA state_dict for checkpointing / inference."""
+        return getattr(self, '_ema_state_dict', None)
 
     def _round_align(self, value: float) -> int:
         if self.alignment_rounding == "floor":
@@ -2319,8 +2364,8 @@ class LTX2DMD(nn.Module):
         max_trig_time = (math.pi / 2) - self.scm_time_eps
         trig_time = trig_time.clamp(min=min_trig_time, max=max_trig_time)
 
-        video_trig_time = trig_time.to(self.dtype).expand(B, F_v)
-        audio_trig_time = trig_time.to(self.dtype).expand(B, F_a) if has_audio else None
+        video_trig_time = trig_time.to(torch.float32).expand(B, F_v)
+        audio_trig_time = trig_time.to(torch.float32).expand(B, F_a) if has_audio else None
 
         # Compute cos/sin in float64 for numerical stability (matching rCM).
         # trig_time is already float64 from _sample_scm_rf_time + rf_to_trig_time.
@@ -2752,8 +2797,8 @@ class LTX2DMD(nn.Module):
         trig_t0 = trig_t_list[0]
         trig_tN = trig_t_list[-1]
 
-        trig_t0_video = trig_t0.to(self.dtype).expand(B, F_v)
-        trig_tN_video = trig_tN.to(self.dtype).expand(B, F_v)
+        trig_t0_video = trig_t0.to(torch.float32).expand(B, F_v)
+        trig_tN_video = trig_tN.to(torch.float32).expand(B, F_v)
         trig_t0_video_view = trig_t0.view(B, 1, 1, 1, 1)
 
         noise_video = torch.randn_like(clean_video)
@@ -2763,8 +2808,8 @@ class LTX2DMD(nn.Module):
         )
 
         if has_audio:
-            trig_t0_audio = trig_t0.to(self.dtype).expand(B, F_a)
-            trig_tN_audio = trig_tN.to(self.dtype).expand(B, F_a)
+            trig_t0_audio = trig_t0.to(torch.float32).expand(B, F_a)
+            trig_tN_audio = trig_tN.to(torch.float32).expand(B, F_a)
             trig_t0_audio_view = trig_t0.view(B, 1, 1)
             noise_audio = torch.randn_like(clean_audio)
             xt_audio = (
@@ -2794,9 +2839,9 @@ class LTX2DMD(nn.Module):
                 dt = (trig_tk - trig_tk1).to(clean_video.dtype)
                 dt_video_view = dt.view(B, 1, 1, 1, 1)
 
-                trig_tk_video = trig_tk.to(self.dtype).expand(B, F_v)
+                trig_tk_video = trig_tk.to(torch.float32).expand(B, F_v)
                 if has_audio:
-                    trig_tk_audio = trig_tk.to(self.dtype).expand(B, F_a)
+                    trig_tk_audio = trig_tk.to(torch.float32).expand(B, F_a)
                 else:
                     trig_tk_audio = None
 

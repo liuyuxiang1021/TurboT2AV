@@ -1,0 +1,135 @@
+# =============================================================================
+# Stage 1: Bidirectional rCM — Aligned with NVIDIA rCM paper implementation
+# Key changes from vanilla rcm.yaml:
+#   - scm_p_G_mean: -0.8 (was 0.7 — matches rCM's LogNormal sampling)
+#   - scm_tangent_warmup: 1000 (was 200 — longer JVP warmup)
+#   - lr: 2e-6 (was 2e-5 — 10x lower for stable SCM+DMD joint training)
+#   - beta1: 0.0 (was 0.9 — no momentum, SCM requires this)
+#   - max_grad_norm: 99999 (effectively disabled — SCM g-norm handles regularization)
+#   - scm_jvp_impl: torch_func (safer than internal, same math)
+#   - dfake_gen_update_ratio: 5 (gen updates every 5 steps, critic trains in between)
+#   - scm_g_normalization: per_modality (matches rCM's L2-norm per sample)
+# =============================================================================
+
+checkpoint_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/ltx-2-19b-dev.safetensors
+gemma_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/gemma-3-12b-it-qat-q4_0-unquantized
+
+model_name: ltx2_av
+
+generator_grad:
+  model: true
+real_score_grad:
+  model: false
+fake_score_grad:
+  model: true
+
+dmd_enabled: true
+critic_enabled: true
+dmd_style: rcm_trig
+dmd_p_D_shift: 5.0
+backward_trig_timesteps:
+  - 1.5
+  - 1.4
+  - 1.0
+
+denoising_step_list:
+  - 1000
+  - 757
+  - 522
+  - 0
+
+num_train_timestep: 1000
+
+real_video_guidance_scale: 3.0
+real_audio_guidance_scale: 5.0
+
+generator_task: bidirectional_av
+real_task_type: bidirectional_av
+fake_task_type: bidirectional_av
+
+denoising_loss_type: velocity
+distillation_loss: dmd
+
+# ============ SCM (aligned with rCM) ============
+scm_enabled: true
+scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/omniforcing_latent_100k
+scm_batch_size: 1
+scm_max_pair: 100000000
+scm_weight: 1.0
+scm_loss_scale: 100.0
+scm_p_G_mean: -0.8           # Changed from 0.7 → matches rCM LogNormal(-0.8, 1.6)
+scm_p_G_std: 1.6
+scm_fd_type: 0               # Exact JVP (faithful rCM)
+scm_strict_rcm: true
+scm_fd_size: 1.0e-4
+scm_tangent_warmup: 1000     # Changed from 200 → matches rCM
+scm_time_eps: 1.0e-4
+scm_jvp_impl: internal        # torch_func crashes with FSDP (torch.func.jvp + FSDP bug in PT2.7)
+scm_g_normalization: per_modality  # Matches rCM's L2-norm per sample
+
+ema_enabled: true                   # EMA for generator (critical for inference quality)
+ema_rate: 0.1                       # rCM power-schedule decay
+
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+
+# ============ Optimizer (aligned with rCM) ============
+lr: 2.0e-06                  # Changed from 2e-5 → 10x lower
+generator_lr: 2.0e-06
+critic_lr: 2.0e-06
+
+beta1: 0.0                   # Changed from 0.9 → no momentum (rCM uses FusedAdam β₁=0)
+beta2: 0.999
+weight_decay: 0.01
+dfake_gen_update_ratio: 5    # Changed from 1 → gen updates every 5 steps
+max_grad_norm: 99999.0       # Effectively disabled (rCM has no grad clipping)
+
+scheduler_type: constant
+
+data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/release_prompts.txt
+backward_simulation: true
+
+negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+
+num_frames: 121
+video_height: 512
+video_width: 768
+
+sharding_strategy: full_shard         # Changed from hybrid_full — matches working config
+fsdp_use_orig_params: true            # Critical for FSDP correctness
+
+generator_fsdp_wrap_strategy: transformer  # Changed from size — matches working config
+real_score_cpu_offload: true          # Offload frozen teacher to CPU (avoids 3x19B OOM)
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+text_encoder_cpu_offload: false
+
+output_path: /data/datasets/turbodiff_datasets_and_ckpt/my_omniforcing
+log_iters: 2                   # Smoke test: log every 2 steps
+train_log_all_scalars: true
+
+wandb_project: OmniForcing
+wandb_entity: liuyuxiang1021-tianjin-university
+wandb_name: stage1_bidirectional_rcm_aligned
+wandb_api_key: "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"
+
+seed: 42
+
+# Smoke test — remove these for full training
+max_steps: 50
+checkpoint_iters: 500
+
+benchmark_enabled: true
+benchmark_iters: 50            # Run benchmark at iter 50 to check inference quality
+benchmark_num_prompts: 8
+benchmark_seed: 12345
+benchmark_video_fps: 24
+benchmark_audio_sample_rate: 24000
+teacher_benchmark_enabled: true
+teacher_benchmark_num_inference_steps: 40
+teacher_benchmark_video_guidance_scale: 3.0
+teacher_benchmark_audio_guidance_scale: 5.0
+teacher_benchmark_mode: rcm_trig
+teacher_benchmark_include_native_rf_reference: true

@@ -236,6 +236,8 @@ class Trainer:
             self.dmd.generator.load_state_dict(ckpt["generator"])
             if self.dmd.fake_score is not None and "critic" in ckpt:
                 self.dmd.fake_score.load_state_dict(ckpt["critic"])
+            if self.dmd.ema_enabled and "generator_ema" in ckpt and ckpt["generator_ema"] is not None:
+                self.dmd._ema_state_dict = {k: v.cpu() for k, v in ckpt["generator_ema"].items()}
             completed_step = int(ckpt.get("completed_step", ckpt.get("step", -1)))
             self.step = int(ckpt.get("next_step", completed_step + 1))
             if self.is_main_process:
@@ -378,6 +380,8 @@ class Trainer:
                 cpu_offload=bool(getattr(config, "generator_cpu_offload", False)),
                 use_orig_params=use_orig_params,
             )
+
+        # EMA stored as lightweight state_dict on CPU — no FSDP wrapping needed
 
         if bool(getattr(config, "real_score_fsdp_enabled", True)):
             self.dmd.real_score = fsdp_wrap(
@@ -657,10 +661,12 @@ class Trainer:
 
         generator_state_dict = fsdp_state_dict(self.dmd.generator)
         critic_state_dict = fsdp_state_dict(self.dmd.fake_score) if self.dmd.fake_score is not None else None
+        generator_ema_state_dict = self.dmd.ema_state_dict()
 
         state_dict = {
             "generator": generator_state_dict,
             "critic": critic_state_dict,
+            "generator_ema": generator_ema_state_dict,
             "step": self.step,
             "completed_step": self.step,
             "next_step": self.step + 1,
@@ -834,6 +840,11 @@ class Trainer:
                 )
             self.generator_optimizer.step()
 
+            # Update EMA (exponential moving average) of generator weights
+            ema_update_iters = int(getattr(self.config, "ema_update_iters", 50))
+            if self.step > 0 and self.step % ema_update_iters == 0:
+                self.dmd.update_ema(self.step)
+
             # ---- Memory cleanup between generator and critic training ----
             # Save scalar metrics before freeing the computation graph.
             # This is critical because step 0 first allocates Adam optimizer
@@ -888,9 +899,11 @@ class Trainer:
         # Benchmark: periodic 4-step inference visualization
         # ALL ranks must participate because FSDP forward passes require
         # collective communication across all ranks.
+        benchmark_min_step = int(getattr(config, "benchmark_min_step", 1))
         BENCHMARK = (
             self.benchmark_enabled
             and len(self.benchmark_prompts) > 0
+            and self.step >= benchmark_min_step
             and self.step % self.benchmark_iters == 0
             and not getattr(config, "no_visualize", False)
         )
@@ -1140,6 +1153,14 @@ class Trainer:
         # then restore the previous mode afterwards.
         was_training = self.dmd.generator.training
         self.dmd.generator.eval()
+
+        # Switch to EMA weights for inference (critical for quality)
+        ema_state = None
+        ema_sd = self.dmd.ema_state_dict()
+        if self.dmd.ema_enabled and ema_sd is not None:
+            ema_state = {k: v.cpu() for k, v in self.dmd.generator.state_dict().items()}
+            self.dmd.generator.load_state_dict(ema_sd)
+
         try:
             if self.benchmark_mode == "causal":
                 pipeline = CausalAVInferencePipeline(
@@ -1204,6 +1225,10 @@ class Trainer:
 
                 barrier()
         finally:
+            # Restore training weights if EMA was used
+            if ema_state is not None:
+                self.dmd.generator.load_state_dict(ema_state)
+                del ema_state
             if was_training:
                 self.dmd.generator.train()
 
