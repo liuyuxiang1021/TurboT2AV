@@ -81,19 +81,21 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 
-def _fp32_jvp_impl(fn, *args_tangent_pairs):
-    """Promote to FP32 with autocast disabled, then cast back."""
-    args = tuple(p for p, _ in args_tangent_pairs)
-    tangents = tuple(t for _, t in args_tangent_pairs)
-    with torch.amp.autocast('cuda', enabled=False):
-        out_fp32, t_out_fp32 = torch.func.jvp(
-            fn, tuple(a.float() for a in args), tuple(t.float() for t in tangents))
-    return out_fp32.to(args[0].dtype), t_out_fp32.detach().to(args[0].dtype)
+def _single_input_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
+    t_x = t_x.to(x.dtype)
+    out, t_out = torch.func.jvp(fn, (x,), (t_x,))
+    return out, t_out.detach()
+
+
+def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y: torch.Tensor):
+    t_x = t_x.to(x.dtype)
+    t_y = t_y.to(y.dtype)
+    out, t_out = torch.func.jvp(fn, (x, y), (t_x, t_y))
+    return out, t_out.detach()
 
 
 def _rms_norm_with_t(x: torch.Tensor, t_x: torch.Tensor, eps: float):
-    # RMS norm has no weights — FP32 safe
-    return _fp32_jvp_impl(lambda z: rms_norm(z, eps=eps), (x, t_x))
+    return _single_input_jvp(lambda z: rms_norm(z, eps=eps), x, t_x)
 
 
 def _attention_with_t(
@@ -110,30 +112,34 @@ def _attention_with_t(
     attention = _unwrap_fsdp(attention)
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         if context is None:
-            return _fp32_jvp_impl(
+            return _single_input_jvp(
                 lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
-                (x, t_x),
+                x,
+                t_x,
             )
         if t_context is None:
-            return _fp32_jvp_impl(
+            return _single_input_jvp(
                 lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-                (x, t_x),
+                x,
+                t_x,
             )
-        return _fp32_jvp_impl(
+        return _two_input_jvp(
             lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-            (x, t_x), (context, t_context),
+            x,
+            context,
+            t_x,
+            t_context,
         )
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
     ff = _unwrap_fsdp(ff)
-    return _fp32_jvp_impl(ff, (x, t_x))
+    return _single_input_jvp(ff, x, t_x)
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
-    # LayerNorm has affine weights — but no matmul, so FP32 promotion is safe
     norm = _unwrap_fsdp(norm)
-    return _fp32_jvp_impl(norm, (x, t_x))
+    return _single_input_jvp(norm, x, t_x)
 
 
 def _ada_values_tangent(

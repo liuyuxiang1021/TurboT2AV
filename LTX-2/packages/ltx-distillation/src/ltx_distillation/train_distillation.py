@@ -238,6 +238,37 @@ class Trainer:
                 self.dmd.fake_score.load_state_dict(ckpt["critic"])
             if self.dmd.ema_enabled and "generator_ema" in ckpt and ckpt["generator_ema"] is not None:
                 self.dmd._ema_state_dict = {k: v.cpu() for k, v in ckpt["generator_ema"].items()}
+
+            # Load optimizer states for seamless resume
+            if "generator_optimizer" in ckpt and ckpt["generator_optimizer"] is not None:
+                try:
+                    osd = ckpt["generator_optimizer"]
+                    flattened_osd = self.generator_optimizer.state_dict()
+                    for key in flattened_osd["state"].keys():
+                        if key in osd["state"]:
+                            flattened_osd["state"][key] = osd["state"][key]
+                    self.generator_optimizer.load_state_dict(flattened_osd)
+                    if self.is_main_process:
+                        print("[Resume] Generator optimizer state loaded")
+                except Exception as e:
+                    print(f"[Resume] Failed to load generator optimizer state: {e}")
+            if self.critic_optimizer is not None and "critic_optimizer" in ckpt and ckpt["critic_optimizer"] is not None:
+                try:
+                    osd = ckpt["critic_optimizer"]
+                    flattened_osd = self.critic_optimizer.state_dict()
+                    for key in flattened_osd["state"].keys():
+                        if key in osd["state"]:
+                            flattened_osd["state"][key] = osd["state"][key]
+                    self.critic_optimizer.load_state_dict(flattened_osd)
+                    if self.is_main_process:
+                        print("[Resume] Critic optimizer state loaded")
+                except Exception as e:
+                    print(f"[Resume] Failed to load critic optimizer state: {e}")
+            if "generator_scheduler" in ckpt and ckpt["generator_scheduler"] is not None and self.generator_scheduler is not None:
+                self.generator_scheduler.load_state_dict(ckpt["generator_scheduler"])
+            if "critic_scheduler" in ckpt and ckpt["critic_scheduler"] is not None and self.critic_scheduler is not None:
+                self.critic_scheduler.load_state_dict(ckpt["critic_scheduler"])
+
             completed_step = int(ckpt.get("completed_step", ckpt.get("step", -1)))
             self.step = int(ckpt.get("next_step", completed_step + 1))
             if self.is_main_process:
@@ -656,7 +687,7 @@ class Trainer:
         torch.cuda.empty_cache()
 
     def save(self):
-        """Save checkpoint."""
+        """Save checkpoint with optimizer states for seamless resume."""
         print("Gathering distributed model states...")
 
         generator_state_dict = fsdp_state_dict(self.dmd.generator)
@@ -680,8 +711,8 @@ class Trainer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
 
-            save_path = os.path.join(checkpoint_dir, "model.pt")
-            torch.save(state_dict, save_path)
+            save_path = os.path.join(checkpoint_dir, "model.pth")
+            torch.save(state_dict, save_path, _use_new_zipfile_serialization=False)
             print(f"Checkpoint saved to {save_path}")
 
     @staticmethod
