@@ -82,18 +82,16 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 def _single_input_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
-    # Promote to FP32 for JVP precision, then cast output back to primal dtype
-    orig_dtype = x.dtype
-    x_fp32 = x.float()
-    t_x_fp32 = t_x.float()
-    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x_fp32,), (t_x_fp32,))
-    return out_fp32.to(orig_dtype), t_out_fp32.detach().to(orig_dtype)
+    t_x = t_x.to(x.dtype)
+    out, t_out = torch.func.jvp(fn, (x,), (t_x,))
+    return out, t_out.detach()
 
 
 def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y: torch.Tensor):
-    orig_dtype = x.dtype
-    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(), y.float()), (t_x.float(), t_y.float()))
-    return out_fp32.to(orig_dtype), t_out_fp32.detach().to(orig_dtype)
+    t_x = t_x.to(x.dtype)
+    t_y = t_y.to(y.dtype)
+    out, t_out = torch.func.jvp(fn, (x, y), (t_x, t_y))
+    return out, t_out.detach()
 
 
 def _rms_norm_with_t(x: torch.Tensor, t_x: torch.Tensor, eps: float):
