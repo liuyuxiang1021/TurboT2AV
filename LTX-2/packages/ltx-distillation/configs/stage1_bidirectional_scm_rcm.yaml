@@ -1,5 +1,5 @@
-# Stage 1: DCM + DMD (JVP-free consistency model)
-# DCM replaces SCM — discrete-time, no JVP, no warmup needed
+# Stage 1: SCM-only — exact rCM alignment for debugging
+# No DMD, no critic, pure Score Consistency Model
 
 checkpoint_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/ltx-2-19b-dev.safetensors
 gemma_path: /data/datasets/turbodiff_datasets_and_ckpt/omniforcing/gemma-3-12b-it-qat-q4_0-unquantized
@@ -8,48 +8,46 @@ model_name: ltx2_av
 
 generator_grad: {model: true}
 real_score_grad: {model: false}
-fake_score_grad: {model: true}
+fake_score_grad: {model: false}
 
-# ===== DMD + Critic =====
-dmd_enabled: true
-critic_enabled: true
+dmd_enabled: false
+critic_enabled: false
 dmd_style: rcm_trig
 dmd_p_D_shift: 5.0
 backward_trig_timesteps: [1.5, 1.4, 1.0]
 denoising_step_list: [1000, 757, 522, 0]
 num_train_timestep: 1000
-
 real_video_guidance_scale: 3.0
 real_audio_guidance_scale: 5.0
+denoising_loss_type: velocity
+distillation_loss: dmd
 
 generator_task: bidirectional_av
 real_task_type: bidirectional_av
 fake_task_type: bidirectional_av
 
-denoising_loss_type: velocity
-distillation_loss: dmd
-
-# ===== DCM (JVP-free, replaces SCM) =====
-dcm_enabled: true
-dcm_weight: 1.0
-dcm_loss_scale: 0.0000002         # DMD:DCM ≈ 1000:1 with sum().mean() loss
-dcm_total_steps: 48
-dcm_skipping_interval_steps: 1
-dcm_timestep_shift: 5.0
-
-scm_enabled: false
+# ===== SCM (exact rCM config) =====
+scm_enabled: true
 scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/omniforcing_latent_100k
-scm_batch_size: 1
-scm_max_pair: 100000000
+scm_weight: 1.0
+scm_loss_scale: 100.0
+scm_p_G_mean: 0.7
+scm_p_G_std: 1.6
+scm_fd_type: 0
+scm_fd_size: 0.0001
+scm_tangent_warmup: 1000
+scm_time_eps: 0.0001
+scm_jvp_impl: internal
+scm_g_normalization: per_modality
 
-# ===== Optimizer =====
-lr: 2.0e-05
-generator_lr: 2.0e-05
-critic_lr: 4.0e-06
+# ===== Optimizer (rCM config) =====
+lr: 2.0e-06
+generator_lr: 2.0e-06
+critic_lr: 4.0e-07
 beta1: 0.0
 beta2: 0.999
 weight_decay: 0.01
-dfake_gen_update_ratio: 5
+dfake_gen_update_ratio: 1
 max_grad_norm: 99999.0
 scheduler_type: constant
 
@@ -82,20 +80,15 @@ train_log_all_scalars: true
 checkpoint_iters: 500
 skip_initial_checkpoint: true
 
-# ===== Benchmark =====
 benchmark_enabled: true
 benchmark_min_step: 1
 benchmark_iters: 50
 teacher_benchmark_enabled: false
 benchmark_num_prompts: 8
-benchmark_seed: 12345
-benchmark_video_fps: 24
-benchmark_audio_sample_rate: 24000
 
-# ===== W&B =====
 wandb_project: OmniForcing
 wandb_entity: liuyuxiang1021-tianjin-university
-wandb_name: dcm_dmd_aligned
+wandb_name: scm_only_rcm_align
 wandb_api_key: "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"
 
 seed: 42
