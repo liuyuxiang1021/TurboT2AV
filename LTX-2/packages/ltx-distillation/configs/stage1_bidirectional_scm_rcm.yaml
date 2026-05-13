@@ -33,7 +33,7 @@ scm_weight: 1.0
 scm_loss_scale: 100.0
 scm_p_G_mean: 0.7
 scm_p_G_std: 1.6
-scm_fd_type: 0                   # Full JVP — now with FP32 weights in JVP path
+scm_fd_type: 1                   # Semi-continuous (rCM 4.2 Solution A): JVP(spatial) + FD(time)
 scm_fd_size: 0.0001
 scm_tangent_warmup: 1000
 scm_time_eps: 0.0001

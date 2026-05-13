@@ -82,10 +82,12 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 def _fp32_jvp_impl(fn, *args_tangent_pairs):
-    """Promote primal+tangent to FP32 for torch.func.jvp, then cast back."""
+    """Promote to FP32 with autocast disabled, then cast back."""
     args = tuple(p for p, _ in args_tangent_pairs)
     tangents = tuple(t for _, t in args_tangent_pairs)
-    out_fp32, t_out_fp32 = torch.func.jvp(fn, tuple(a.float() for a in args), tuple(t.float() for t in tangents))
+    with torch.amp.autocast('cuda', enabled=False):
+        out_fp32, t_out_fp32 = torch.func.jvp(
+            fn, tuple(a.float() for a in args), tuple(t.float() for t in tangents))
     return out_fp32.to(args[0].dtype), t_out_fp32.detach().to(args[0].dtype)
 
 
@@ -107,36 +109,25 @@ def _attention_with_t(
 ):
     attention = _unwrap_fsdp(attention)
     with sdpa_kernel(backends=[SDPBackend.MATH]):
-        # Promote attention weights to FP32 for exact JVP
-        orig_dtype = attention.to_q.weight.dtype
-        attention.to(torch.float32)
-        try:
-            if context is None:
-                return _fp32_jvp_impl(
-                    lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
-                    (x, t_x),
-                )
-            if t_context is None:
-                return _fp32_jvp_impl(
-                    lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-                    (x, t_x),
-                )
+        if context is None:
             return _fp32_jvp_impl(
-                lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-                (x, t_x), (context, t_context),
+                lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
+                (x, t_x),
             )
-        finally:
-            attention.to(orig_dtype)
+        if t_context is None:
+            return _fp32_jvp_impl(
+                lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
+                (x, t_x),
+            )
+        return _fp32_jvp_impl(
+            lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
+            (x, t_x), (context, t_context),
+        )
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
     ff = _unwrap_fsdp(ff)
-    orig_dtype = next(ff.parameters()).dtype
-    ff.to(torch.float32)
-    try:
-        return _fp32_jvp_impl(ff, (x, t_x))
-    finally:
-        ff.to(orig_dtype)
+    return _fp32_jvp_impl(ff, (x, t_x))
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
