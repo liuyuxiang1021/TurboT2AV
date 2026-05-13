@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -81,42 +81,30 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 
-def _single_input_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
-    # Promote primal+tangent to FP32 for JVP precision (rCM requires this).
-    # Resulting tangent stores FP32 precision; cast back to primal dtype after.
-    orig_dtype = x.dtype
-    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(),), (t_x.float(),))
-    return out_fp32.to(orig_dtype), t_out_fp32.detach().to(orig_dtype)
-
-
-def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y: torch.Tensor):
-    orig_dtype = x.dtype
-    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(), y.float()), (t_x.float(), t_y.float()))
-    return out_fp32.to(orig_dtype), t_out_fp32.detach().to(orig_dtype)
-
-
-@contextmanager
-def _fp32_weights(module: torch.nn.Module):
-    """Temporarily promote all Linear layer weights to FP32 for JVP computation."""
-    saved = {}
-    for m in module.modules():
-        if isinstance(m, torch.nn.Linear):
-            saved[m] = (m.weight.dtype, m.weight.data, m.bias.data if m.bias is not None else None)
-            m.weight.data = m.weight.data.float()
-            if m.bias is not None:
-                m.bias.data = m.bias.data.float()
+def _fp32_safe_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
+    """Promote to FP32 for JVP; fall back to bf16 if weights are bf16 (Linear layers)."""
     try:
-        yield
-    finally:
-        for m, (orig_dtype, orig_w, orig_b) in saved.items():
-            m.weight.data = orig_w.to(orig_dtype)
-            if orig_b is not None:
-                m.bias.data = orig_b.to(orig_dtype)
+        out, t_out = torch.func.jvp(fn, (x.float(),), (t_x.float(),))
+        return out.to(x.dtype), t_out.detach().to(x.dtype)
+    except RuntimeError:
+        t_x_bf16 = t_x.to(x.dtype)
+        out, t_out = torch.func.jvp(fn, (x,), (t_x_bf16,))
+        return out, t_out.detach()
+
+
+def _fp32_safe_jvp2(fn, x, y, t_x, t_y):
+    """Two-input version with FP32 fallback."""
+    try:
+        out, t_out = torch.func.jvp(fn, (x.float(), y.float()), (t_x.float(), t_y.float()))
+        return out.to(x.dtype), t_out.detach().to(x.dtype)
+    except RuntimeError:
+        t_x_bf16, t_y_bf16 = t_x.to(x.dtype), t_y.to(y.dtype)
+        out, t_out = torch.func.jvp(fn, (x, y), (t_x_bf16, t_y_bf16))
+        return out, t_out.detach()
 
 
 def _rms_norm_with_t(x: torch.Tensor, t_x: torch.Tensor, eps: float):
-    # RMS norm has no Linear weights — safe for FP32 promotion
-    return _single_input_jvp(lambda z: rms_norm(z, eps=eps), x, t_x)
+    return _fp32_safe_jvp(lambda z: rms_norm(z, eps=eps), x, t_x)
 
 
 def _attention_with_t(
@@ -132,33 +120,30 @@ def _attention_with_t(
 ):
     attention = _unwrap_fsdp(attention)
     with sdpa_kernel(backends=[SDPBackend.MATH]):
-        with _fp32_weights(attention):
-            if context is None:
-                return _single_input_jvp(
-                    lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
-                    x, t_x,
-                )
-            if t_context is None:
-                return _single_input_jvp(
-                    lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-                    x, t_x,
-                )
-            return _two_input_jvp(
-                lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-                x, context, t_x, t_context,
+        if context is None:
+            return _fp32_safe_jvp(
+                lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
+                x, t_x,
             )
+        if t_context is None:
+            return _fp32_safe_jvp(
+                lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
+                x, t_x,
+            )
+        return _fp32_safe_jvp2(
+            lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
+            x, context, t_x, t_context,
+        )
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
     ff = _unwrap_fsdp(ff)
-    with _fp32_weights(ff):
-        return _single_input_jvp(ff, x, t_x)
+    return _fp32_safe_jvp(ff, x, t_x)
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
-    # LayerNorm has no matmul with weights — safe for FP32 promotion
     norm = _unwrap_fsdp(norm)
-    return _single_input_jvp(norm, x, t_x)
+    return _fp32_safe_jvp(norm, x, t_x)
 
 
 def _ada_values_tangent(
