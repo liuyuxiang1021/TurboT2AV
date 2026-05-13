@@ -81,8 +81,8 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 def _match_primal_dtype(tangent: torch.Tensor, primal: torch.Tensor) -> torch.Tensor:
-    if torch.is_floating_point(tangent) and tangent.dtype != primal.dtype:
-        return tangent.to(primal.dtype)
+    # Keep tangents in FP32 for precision (rCM requires high-precision JVP).
+    # bf16 tangents accumulate ~1e-3 error per layer × 40 layers = 4% error.
     return tangent
 
 
