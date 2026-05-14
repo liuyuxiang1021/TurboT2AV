@@ -14,7 +14,6 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
 from ltx_core.model.transformer.rope import apply_rotary_emb
-from ltx_distillation.models.flash_attention_jvp_triton import _attention as FlashAttnJVP
 from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock
 from ltx_core.model.transformer.transformer_args import (
@@ -137,9 +136,9 @@ def _attention_with_t(
         v = attn.to_v(ctx)
         t_v = _linear_tangent(attn.to_v, ctx_t)
 
-        # RMS norm JVP: FP32 (no weights)
-        q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
-        k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
+        # RMS norm JVP: use actual nn.Module (has affine weight)
+        q, t_q = _single_input_jvp(attn.q_norm, q, t_q)
+        k, t_k = _single_input_jvp(attn.k_norm, k, t_k)
 
         # RoPE JVP: FP32 (no weights)
         if pe is not None:
@@ -153,26 +152,17 @@ def _attention_with_t(
                 (k.float(),), (t_k.float(),))
             k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
 
-        # SDPA JVP: rCM FlashAttn JVP Triton kernel (fp32, fast)
-        B = q.shape[0]
-        H = attn.heads
-        D = attn.dim_head
-        sm_scale = D ** (-0.5)
-
-        # Reshape to [B, H, S, D] for Triton kernel
-        q_h = q.float().reshape(B, q.shape[1], H, D).transpose(1, 2).contiguous()
-        k_h = k.float().reshape(B, k.shape[1], H, D).transpose(1, 2).contiguous()
-        v_h = v.float().reshape(B, v.shape[1], H, D).transpose(1, 2).contiguous()
-        tq_h = t_q.float().reshape(B, t_q.shape[1], H, D).transpose(1, 2).contiguous()
-        tk_h = t_k.float().reshape(B, t_k.shape[1], H, D).transpose(1, 2).contiguous()
-        tv_h = t_v.float().reshape(B, t_v.shape[1], H, D).transpose(1, 2).contiguous()
-
-        attn_out_h, t_attn_out_h = FlashAttnJVP.apply(
-            q_h, k_h, v_h, tq_h, tk_h, tv_h, sm_scale)
-
-        # Merge heads back to [B, S, D]
-        attn_out = attn_out_h.transpose(1, 2).reshape(B, -1, H * D).to(x.dtype)
-        t_attn_out = t_attn_out_h.transpose(1, 2).reshape(B, -1, H * D).to(x.dtype)
+        # SDPA JVP: FP32 torch.func.jvp on attention_function
+        # attention_function expects [B, S, D], handles head splitting internally
+        def _attn_fn(qq, kk, vv):
+            return attn.attention_function(qq, kk, vv, attn.heads, mask)
+        attn_out, t_attn_out = torch.func.jvp(
+            _attn_fn,
+            (q.float(), k.float(), v.float()),
+            (t_q.float(), t_k.float(), t_v.float()),
+        )
+        attn_out = attn_out.to(x.dtype)
+        t_attn_out = t_attn_out.detach().to(x.dtype)
 
         # Output projection tangent: FP32
         out = attn.to_out(attn_out)
