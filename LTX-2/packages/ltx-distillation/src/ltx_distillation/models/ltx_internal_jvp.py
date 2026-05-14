@@ -136,9 +136,11 @@ def _attention_with_t(
         v = attn.to_v(ctx)
         t_v = _linear_tangent(attn.to_v, ctx_t)
 
-        # RMS norm JVP: use actual nn.Module (has affine weight)
-        q, t_q = _single_input_jvp(attn.q_norm, q, t_q)
-        k, t_k = _single_input_jvp(attn.k_norm, k, t_k)
+        # RMS norm JVP: FP32 (nn.RMSNorm has no matmul, safe to promote)
+        q, t_q = torch.func.jvp(attn.q_norm, (q.float(),), (t_q.float(),))
+        q, t_q = q.to(x.dtype), t_q.detach().to(x.dtype)
+        k, t_k = torch.func.jvp(attn.k_norm, (k.float(),), (t_k.float(),))
+        k, t_k = k.to(x.dtype), t_k.detach().to(x.dtype)
 
         # RoPE JVP: FP32 (no weights)
         if pe is not None:
