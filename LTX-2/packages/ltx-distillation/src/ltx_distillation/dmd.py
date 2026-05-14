@@ -2532,13 +2532,12 @@ class LTX2DMD(nn.Module):
             dim=(1, 2, 3, 4),
             keepdim=True,
         )
-        video_tangent_abs_max = torch.amax(
-            torch.abs(t_F_theta_video.detach()),
-            dim=(1, 2, 3, 4),
-            keepdim=True,
-        )
+        # p99 quantile: robust to single-element outliers, catches local spikes
+        video_tangent_abs_p99 = torch.quantile(
+            torch.abs(t_F_theta_video.detach()).flatten(1), 0.99, dim=1
+        ).view(B, 1, 1, 1, 1)
         video_tangent_raw_mean = video_tangent_abs_mean.mean()
-        video_tangent_raw_max = video_tangent_abs_max.mean()
+        video_tangent_raw_p99 = video_tangent_abs_p99.mean()
         video_tangent_reject_mask = torch.zeros(
             (B, 1, 1, 1, 1),
             device=t_F_theta_video.device,
@@ -2550,7 +2549,7 @@ class LTX2DMD(nn.Module):
         if self.scm_tangent_clip_mean > 0:
             video_tangent_scale = (
                 self.scm_tangent_clip_mean
-                / video_tangent_abs_max.clamp_min(1e-12)
+                / video_tangent_abs_p99.clamp_min(1e-12)
             ).clamp(max=1.0)
             t_F_theta_video = t_F_theta_video * video_tangent_scale
             video_tangent_clip_scale = video_tangent_scale.mean()
@@ -2561,13 +2560,11 @@ class LTX2DMD(nn.Module):
                 dim=(1, 2),
                 keepdim=True,
             )
-            audio_tangent_abs_max = torch.amax(
-                torch.abs(t_F_theta_audio.detach()),
-                dim=(1, 2),
-                keepdim=True,
-            )
+            audio_tangent_abs_p99 = torch.quantile(
+                torch.abs(t_F_theta_audio.detach()).flatten(1), 0.99, dim=1
+            ).view(B, 1, 1)
             audio_tangent_raw_mean = audio_tangent_abs_mean.mean()
-            audio_tangent_raw_max = audio_tangent_abs_max.mean()
+            audio_tangent_raw_p99 = audio_tangent_abs_p99.mean()
             audio_tangent_reject_mask = torch.zeros(
                 (B, 1, 1),
                 device=t_F_theta_audio.device,
@@ -2579,13 +2576,13 @@ class LTX2DMD(nn.Module):
             if self.scm_tangent_clip_mean > 0:
                 audio_tangent_scale = (
                     self.scm_tangent_clip_mean
-                    / audio_tangent_abs_max.clamp_min(1e-12)
+                    / audio_tangent_abs_p99.clamp_min(1e-12)
                 ).clamp(max=1.0)
                 t_F_theta_audio = t_F_theta_audio * audio_tangent_scale
                 audio_tangent_clip_scale = audio_tangent_scale.mean()
         else:
             audio_tangent_raw_mean = None
-            audio_tangent_raw_max = None
+            audio_tangent_raw_p99 = None
             audio_tangent_clip_scale = None
             audio_tangent_reject_mask = None
 
@@ -2763,7 +2760,7 @@ class LTX2DMD(nn.Module):
             "alignment/scm_video_tangent_norm": torch.mean(
                 torch.abs(t_F_theta_video)
             ).item(),
-            "alignment/scm_video_tangent_max": video_tangent_raw_max.item(),
+            "alignment/scm_video_tangent_p99": video_tangent_raw_p99.item(),
             "alignment/scm_video_tangent_raw_norm": video_tangent_raw_mean.item(),
             "alignment/scm_video_tangent_clip_scale": video_tangent_clip_scale.item(),
             "alignment/scm_video_tangent_reject_ratio": video_tangent_reject_mask.float().mean().item(),
@@ -2783,7 +2780,7 @@ class LTX2DMD(nn.Module):
             log_dict["alignment/scm_audio_tangent_norm"] = torch.mean(
                 torch.abs(t_F_theta_audio)
             ).item()
-            log_dict["alignment/scm_audio_tangent_max"] = audio_tangent_raw_max.item()
+            log_dict["alignment/scm_audio_tangent_p99"] = audio_tangent_raw_p99.item()
             log_dict["alignment/scm_audio_tangent_raw_norm"] = audio_tangent_raw_mean.item()
             log_dict["alignment/scm_audio_tangent_clip_scale"] = audio_tangent_clip_scale.item()
             log_dict["alignment/scm_audio_tangent_reject_ratio"] = audio_tangent_reject_mask.float().mean().item()

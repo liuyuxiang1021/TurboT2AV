@@ -1100,9 +1100,9 @@ class Trainer:
                     summary_parts.append(
                         f"video_tangent={wandb_dict['train/alignment/scm_video_tangent_norm']:.6f}"
                     )
-                if "train/alignment/scm_video_tangent_max" in wandb_dict:
+                if "train/alignment/scm_video_tangent_p99" in wandb_dict:
                     summary_parts.append(
-                        f"video_tmax={wandb_dict['train/alignment/scm_video_tangent_max']:.4f}"
+                        f"video_tp99={wandb_dict['train/alignment/scm_video_tangent_p99']:.4f}"
                     )
                 if "train/alignment/scm_video_teacher_norm" in wandb_dict:
                     summary_parts.append(
@@ -1136,9 +1136,9 @@ class Trainer:
                     summary_parts.append(
                         f"audio_tangent={wandb_dict['train/alignment/scm_audio_tangent_norm']:.6f}"
                     )
-                if "train/alignment/scm_audio_tangent_max" in wandb_dict:
+                if "train/alignment/scm_audio_tangent_p99" in wandb_dict:
                     summary_parts.append(
-                        f"audio_tmax={wandb_dict['train/alignment/scm_audio_tangent_max']:.4f}"
+                        f"audio_tp99={wandb_dict['train/alignment/scm_audio_tangent_p99']:.4f}"
                     )
                 if "train/alignment/scm_audio_teacher_norm" in wandb_dict:
                     summary_parts.append(

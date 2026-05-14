@@ -36,10 +36,8 @@ scm_p_G_std: 1.6
 scm_fd_type: 0
 scm_fd_size: 0.0001
 scm_tangent_warmup: 0            # rCM 4.2: not needed for large models with FP32 time
-# Diagnostic mode: pin fixed samples, repeat with different t to measure variance
-scm_diagnostic_mode: true
-scm_diagnostic_num_samples: 4
-scm_diagnostic_num_repeats: 20
+scm_diagnostic_mode: false
+scm_tangent_clip_mean: 20.0       # p99-based clipping threshold (acts on per-sample p99 of |t_F|)
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
 scm_g_normalization: per_modality
