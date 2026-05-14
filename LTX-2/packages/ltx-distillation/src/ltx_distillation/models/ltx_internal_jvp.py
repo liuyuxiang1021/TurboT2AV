@@ -46,7 +46,8 @@ def _unwrap_fsdp(module):
 
 
 def _linear_tangent(linear: torch.nn.Linear, t_x: torch.Tensor) -> torch.Tensor:
-    return F.linear(t_x.to(dtype=linear.weight.dtype), linear.weight, None)
+    """Compute linear tangent in FP32, return in weight's dtype."""
+    return F.linear(t_x.float(), linear.weight.float(), None).to(linear.weight.dtype)
 
 
 def _linear_fp32_no_param_grad(linear: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -95,7 +96,10 @@ def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y:
 
 
 def _rms_norm_with_t(x: torch.Tensor, t_x: torch.Tensor, eps: float):
-    return _single_input_jvp(lambda z: rms_norm(z, eps=eps), x, t_x)
+    """FP32 RMS norm JVP — no weights, safe to promote."""
+    out_fp32, t_out_fp32 = torch.func.jvp(
+        lambda z: rms_norm(z, eps=eps), (x.float(),), (t_x.float(),))
+    return out_fp32.to(x.dtype), t_out_fp32.detach().to(x.dtype)
 
 
 def _attention_with_t(
