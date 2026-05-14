@@ -13,6 +13,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
+from ltx_core.model.transformer.rope import apply_rotary_emb
 from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock
 from ltx_core.model.transformer.transformer_args import (
@@ -82,16 +83,15 @@ def _adaln_single_fp32(adaln: torch.nn.Module, timestep: torch.Tensor) -> tuple[
 
 
 def _single_input_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
-    t_x = t_x.to(x.dtype)
-    out, t_out = torch.func.jvp(fn, (x,), (t_x,))
-    return out, t_out.detach()
+    """FP32 JVP for ops without Linear weights (norm, activation, RoPE, SDPA)."""
+    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(),), (t_x.float(),))
+    return out_fp32.to(x.dtype), t_out_fp32.detach().to(x.dtype)
 
 
 def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y: torch.Tensor):
-    t_x = t_x.to(x.dtype)
-    t_y = t_y.to(y.dtype)
-    out, t_out = torch.func.jvp(fn, (x, y), (t_x, t_y))
-    return out, t_out.detach()
+    """FP32 JVP for two-input ops without Linear weights."""
+    out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(), y.float()), (t_x.float(), t_y.float()))
+    return out_fp32.to(x.dtype), t_out_fp32.detach().to(x.dtype)
 
 
 def _rms_norm_with_t(x: torch.Tensor, t_x: torch.Tensor, eps: float):
@@ -109,32 +109,73 @@ def _attention_with_t(
     pe: torch.Tensor | None,
     k_pe: torch.Tensor | None,
 ):
-    attention = _unwrap_fsdp(attention)
+    """Manual FP32 attention JVP — aligned with rCM's flash_attention_jvp_triton approach.
+
+    Decomposes attention into QKV/projection (Linear with manual fp32 tangent)
+    and norm/attention (FP32 torch.func.jvp). This avoids bf16 precision loss
+    in the 40-layer tangent propagation chain.
+    """
+    attn = _unwrap_fsdp(attention)
+    ctx = x if context is None else context
+    ctx_t = t_x if t_context is None else t_context
+
     with sdpa_kernel(backends=[SDPBackend.MATH]):
-        if context is None:
-            return _single_input_jvp(
-                lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
-                x,
-                t_x,
-            )
-        if t_context is None:
-            return _single_input_jvp(
-                lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-                x,
-                t_x,
-            )
-        return _two_input_jvp(
-            lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-            x,
-            context,
-            t_x,
-            t_context,
-        )
+        # ---- Forward pass (bf16 for memory) + Tangent (fp32 for precision) ----
+
+        # QKV projections: manual fp32 linear tangent
+        q = attn.to_q(x)
+        t_q = _linear_tangent(attn.to_q, t_x.float()).to(x.dtype)
+        k = attn.to_k(ctx)
+        t_k = _linear_tangent(attn.to_k, ctx_t.float()).to(x.dtype)
+        v = attn.to_v(ctx)
+        t_v = _linear_tangent(attn.to_v, ctx_t.float()).to(x.dtype)
+
+        # RMS norm: fp32 JVP (no weights, safe)
+        q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
+        k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
+
+        # RoPE: fp32 JVP (no weights, safe)
+        if pe is not None:
+            out_q, t_out_q = torch.func.jvp(
+                lambda z: apply_rotary_emb(z, pe, attn.rope_type),
+                (q.float(),), (t_q.float(),))
+            q, t_q = out_q.to(x.dtype), t_out_q.detach().to(x.dtype)
+            pe_k = pe if k_pe is None else k_pe
+            out_k, t_out_k = torch.func.jvp(
+                lambda z: apply_rotary_emb(z, pe_k, attn.rope_type),
+                (k.float(),), (t_k.float(),))
+            k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
+
+        # SDPA: attention function with fp32 JVP (no weights, safe)
+        def _attn_fn(qq, kk, vv):
+            return attn.attention_function(qq, kk, vv, attn.heads, mask)
+        attn_out, t_attn_out = torch.func.jvp(
+            _attn_fn, (q.float(), k.float(), v.float()), (t_q.float(), t_k.float(), t_v.float()))
+        attn_out = attn_out.to(x.dtype)
+        t_attn_out = t_attn_out.detach().to(x.dtype)
+
+        # Output projection: manual fp32 linear tangent
+        out = attn.to_out(attn_out)
+        t_out = _linear_tangent(attn.to_out[0], t_attn_out.float()).to(x.dtype)
+
+        return out, t_out
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
+    """Manual FP32 FFN JVP — decomposed Linear layers with fp32 tangent."""
     ff = _unwrap_fsdp(ff)
-    return _single_input_jvp(ff, x, t_x)
+    project_in = ff.net[0]  # GELUApprox: Linear + GELU activation
+    project_out = ff.net[2]  # Linear
+
+    # Layer 1: Linear part
+    y = F.linear(x, project_in.weight, project_in.bias)
+    t_y = _linear_tangent(project_in, t_x.float()).to(x.dtype)
+    # GELU activation
+    y, t_y = _single_input_jvp(project_in.act, y, t_y)
+    # Layer 2: Linear
+    out = F.linear(y, project_out.weight, project_out.bias)
+    t_out = _linear_tangent(project_out, t_y.float()).to(x.dtype)
+    return out, t_out
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
