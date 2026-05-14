@@ -33,10 +33,9 @@ scm_weight: 1.0
 scm_loss_scale: 100.0
 scm_p_G_mean: 0.7
 scm_p_G_std: 1.6
-scm_fd_type: 1                   # Semi-continuous: stable on FSDP
-scm_strict_rcm: false
+scm_fd_type: 0
 scm_fd_size: 0.0001
-scm_tangent_warmup: 1000
+scm_tangent_warmup: 200
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
 scm_g_normalization: per_modality
