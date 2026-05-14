@@ -13,6 +13,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
+from ltx_core.model.transformer.rope import apply_rotary_emb
 from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock
 from ltx_core.model.transformer.transformer_args import (
