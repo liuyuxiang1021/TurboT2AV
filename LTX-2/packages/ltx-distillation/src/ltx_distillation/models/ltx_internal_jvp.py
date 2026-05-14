@@ -189,8 +189,10 @@ def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
+    """FP32 LayerNorm JVP — element-wise affine, no matmul, FP32-safe."""
     norm = _unwrap_fsdp(norm)
-    return _single_input_jvp(norm, x, t_x)
+    out_fp32, t_out_fp32 = torch.func.jvp(norm, (x.float(),), (t_x.float(),))
+    return out_fp32.to(x.dtype), t_out_fp32.detach().to(x.dtype)
 
 
 def _ada_values_tangent(
