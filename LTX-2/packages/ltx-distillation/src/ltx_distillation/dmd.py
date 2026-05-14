@@ -2534,8 +2534,8 @@ class LTX2DMD(nn.Module):
         )
         # p99 quantile: robust to single-element outliers, catches local spikes
         video_tangent_abs_p99 = torch.quantile(
-            torch.abs(t_F_theta_video.detach()).flatten(1), 0.99, dim=1
-        ).view(B, 1, 1, 1, 1)
+            torch.abs(t_F_theta_video.detach()).float().flatten(1), 0.99, dim=1
+        ).to(t_F_theta_video.dtype).view(B, 1, 1, 1, 1)
         video_tangent_raw_mean = video_tangent_abs_mean.mean()
         video_tangent_raw_p99 = video_tangent_abs_p99.mean()
         video_tangent_reject_mask = torch.zeros(
@@ -2561,8 +2561,8 @@ class LTX2DMD(nn.Module):
                 keepdim=True,
             )
             audio_tangent_abs_p99 = torch.quantile(
-                torch.abs(t_F_theta_audio.detach()).flatten(1), 0.99, dim=1
-            ).view(B, 1, 1)
+                torch.abs(t_F_theta_audio.detach()).float().flatten(1), 0.99, dim=1
+            ).to(t_F_theta_audio.dtype).view(B, 1, 1)
             audio_tangent_raw_mean = audio_tangent_abs_mean.mean()
             audio_tangent_raw_p99 = audio_tangent_abs_p99.mean()
             audio_tangent_reject_mask = torch.zeros(
