@@ -512,6 +512,26 @@ class Trainer:
             )
             self.scm_dataloader = cycle(scm_dataloader)
 
+            # Diagnostic mode: pre-fetch fixed samples for variance analysis
+            self.scm_diagnostic_mode = bool(getattr(config, "scm_diagnostic_mode", False))
+            self.scm_diagnostic_num_repeats = int(getattr(config, "scm_diagnostic_num_repeats", 20))
+            self.scm_diagnostic_samples = []
+            if self.scm_diagnostic_mode:
+                num_samples = int(getattr(config, "scm_diagnostic_num_samples", 4))
+                raw_dataset = scm_dataset  # un-shuffled, direct index access
+                for i in range(min(num_samples, len(raw_dataset))):
+                    sample = raw_dataset[i]
+                    prompts = sample["prompts"]
+                    video = sample["ode_latent"][:, -1].clone()  # [F, C, H, W]
+                    audio = None
+                    if "ode_audio_latent" in sample and sample["ode_audio_latent"] is not None:
+                        audio = sample["ode_audio_latent"][:, -1].clone()
+                    self.scm_diagnostic_samples.append((prompts, video, audio))
+                if self.is_main_process:
+                    print(f"[SCM Diagnostic] Pinned {len(self.scm_diagnostic_samples)} samples, "
+                          f"each repeated {self.scm_diagnostic_num_repeats}x "
+                          f"(total {len(self.scm_diagnostic_samples) * self.scm_diagnostic_num_repeats} diagnostic steps)")
+
     def _get_unconditional_dict(self, batch_size: int) -> Dict[str, Any]:
         """Cache unconditional text embeddings by batch size."""
         if not hasattr(self, "_unconditional_dict_cache"):
@@ -530,6 +550,20 @@ class Trainer:
         """Fetch one faithful SCM batch containing real clean latents."""
         if self.scm_dataloader is None:
             raise RuntimeError("CM batch requested but scm_dataloader is not initialized")
+
+        # Diagnostic mode: repeat fixed samples to measure within/between-sample variance
+        if self.scm_diagnostic_mode and self.scm_diagnostic_samples:
+            num_samples = len(self.scm_diagnostic_samples)
+            num_repeats = self.scm_diagnostic_num_repeats
+            # Map step to (sample_idx, repeat_idx)
+            diag_step = self.step % (num_samples * num_repeats)
+            sample_idx = diag_step % num_samples
+            repeat_idx = diag_step // num_samples
+            prompts, video, audio = self.scm_diagnostic_samples[sample_idx]
+            # Clone to avoid mutating the cached copy
+            clean_video = video.clone().to(device=self.device, dtype=self.dtype)
+            clean_audio = audio.clone().to(device=self.device, dtype=self.dtype) if audio is not None else None
+            return [prompts], clean_video, clean_audio
 
         batch = next(self.scm_dataloader)
         text_prompts = batch["prompts"]
@@ -971,11 +1005,27 @@ class Trainer:
                 self.critic_optimizer.param_groups[0]["lr"] if self.critic_optimizer is not None else 0.0
             )
 
+            # Diagnostic mode: tag each step with sample/repeat index
+            if self.scm_diagnostic_mode and self.scm_diagnostic_samples:
+                num_samples = len(self.scm_diagnostic_samples)
+                num_repeats = self.scm_diagnostic_num_repeats
+                diag_step = self.step % (num_samples * num_repeats)
+                wandb_dict["train/diag_sample_idx"] = diag_step % num_samples
+                wandb_dict["train/diag_repeat_idx"] = diag_step // num_samples
+
             self._safe_wandb_log(wandb_dict, step=self.step)
 
             if self.log_iters > 0 and self.step % self.log_iters == 0:
                 summary_parts = [
                     f"step={self.step}",
+                ]
+                if self.scm_diagnostic_mode and self.scm_diagnostic_samples:
+                    diag_s = self.step % (len(self.scm_diagnostic_samples) * self.scm_diagnostic_num_repeats)
+                    summary_parts.append(
+                        f"diag_s={diag_s % len(self.scm_diagnostic_samples)}/"
+                        f"r={diag_s // len(self.scm_diagnostic_samples)}"
+                    )
+                summary_parts += [
                     f"gen_loss={wandb_dict.get('train/generator_loss', 0.0):.6f}",
                     f"critic_loss={wandb_dict.get('train/critic_loss', 0.0):.6f}",
                     f"lr_g={wandb_dict.get('train/lr_generator', 0.0):.2e}",
