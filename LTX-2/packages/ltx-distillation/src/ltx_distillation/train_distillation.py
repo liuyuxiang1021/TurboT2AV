@@ -522,10 +522,12 @@ class Trainer:
                 for i in range(min(num_samples, len(raw_dataset))):
                     sample = raw_dataset[i]
                     prompts = sample["prompts"]
-                    video = sample["ode_latent"][:, -1].clone()  # [F, C, H, W]
+                    # raw dataset returns [T, C, H, W] without batch dim.
+                    # Add batch dim to match the dataloader-collated shape [B=1, C, H, W].
+                    video = sample["ode_latent"][:, -1].unsqueeze(0).clone()
                     audio = None
                     if "ode_audio_latent" in sample and sample["ode_audio_latent"] is not None:
-                        audio = sample["ode_audio_latent"][:, -1].clone()
+                        audio = sample["ode_audio_latent"][:, -1].unsqueeze(0).clone()
                     self.scm_diagnostic_samples.append((prompts, video, audio))
                 if self.is_main_process:
                     print(f"[SCM Diagnostic] Pinned {len(self.scm_diagnostic_samples)} samples, "
