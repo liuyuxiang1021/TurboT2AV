@@ -35,7 +35,7 @@ scm_p_G_mean: -0.8              # Lower sigma → stronger cos(t) → consistenc
 scm_p_G_std: 1.6
 scm_fd_type: 0
 scm_fd_size: 0.0001
-scm_tangent_warmup: 1000         # Longer: let consistency establish before JVP tangent
+scm_tangent_warmup: 0            # rCM 4.2: not needed for large models with FP32 time
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
 scm_g_normalization: per_modality
