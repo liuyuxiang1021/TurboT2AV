@@ -88,6 +88,13 @@ def _single_input_jvp(fn, x: torch.Tensor, t_x: torch.Tensor):
     return out_fp32.to(x.dtype), t_out_fp32.detach().to(x.dtype)
 
 
+def _single_input_jvp_bf16(fn, x: torch.Tensor, t_x: torch.Tensor):
+    """Original bf16 JVP — used as fallback for cross-attention with fixed context."""
+    t_x_bf16 = t_x.to(x.dtype)
+    out, t_out = torch.func.jvp(fn, (x,), (t_x_bf16,))
+    return out, t_out.detach()
+
+
 def _two_input_jvp(fn, x: torch.Tensor, y: torch.Tensor, t_x: torch.Tensor, t_y: torch.Tensor):
     """FP32 JVP for two-input ops without Linear weights."""
     out_fp32, t_out_fp32 = torch.func.jvp(fn, (x.float(), y.float()), (t_x.float(), t_y.float()))
@@ -112,46 +119,47 @@ def _attention_with_t(
     """Manual FP32 attention JVP — aligned with rCM's flash_attention_jvp_triton approach."""
     attn = _unwrap_fsdp(attention)
 
-    # When context has no tangent (cross-attn with fixed audio), fall back
-    # to original single-input JVP — only differentiate through query.
-    if context is not None and t_context is None:
-        return _single_input_jvp(
+    # Self-attention or cross-attention with both tangents: full decomposition
+    if context is None or t_context is not None:
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            ctx = x if context is None else context
+            ctx_t = t_x if context is None else t_context
+
+            q = attn.to_q(x)
+            t_q = _linear_tangent(attn.to_q, t_x.float()).to(x.dtype)
+            k = attn.to_k(ctx)
+            t_k = _linear_tangent(attn.to_k, ctx_t.float()).to(x.dtype)
+            v = attn.to_v(ctx)
+            t_v = _linear_tangent(attn.to_v, ctx_t.float()).to(x.dtype)
+
+            q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
+            k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
+
+            if pe is not None:
+                out_q, t_out_q = torch.func.jvp(
+                    lambda z: apply_rotary_emb(z, pe, attn.rope_type), (q.float(),), (t_q.float(),))
+                q, t_q = out_q.to(x.dtype), t_out_q.detach().to(x.dtype)
+                pe_k = pe if k_pe is None else k_pe
+                out_k, t_out_k = torch.func.jvp(
+                    lambda z: apply_rotary_emb(z, pe_k, attn.rope_type), (k.float(),), (t_k.float(),))
+                k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
+
+            def _attn_fn(qq, kk, vv):
+                return attn.attention_function(qq, kk, vv, attn.heads, mask)
+            attn_out, t_attn_out = torch.func.jvp(
+                _attn_fn, (q.float(), k.float(), v.float()), (t_q.float(), t_k.float(), t_v.float()))
+            attn_out = attn_out.to(x.dtype)
+            t_attn_out = t_attn_out.detach().to(x.dtype)
+
+            out = attn.to_out(attn_out)
+            t_out = _linear_tangent(attn.to_out[0], t_attn_out.float()).to(x.dtype)
+            return out, t_out
+
+    # Cross-attention with fixed context (no tangent for k/v): original bf16 path
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        return _single_input_jvp_bf16(
             lambda xx: attn(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
             x, t_x)
-
-    with sdpa_kernel(backends=[SDPBackend.MATH]):
-        ctx = x if context is None else context
-        ctx_t = t_x if t_context is None else t_context
-
-        q = attn.to_q(x)
-        t_q = _linear_tangent(attn.to_q, t_x.float()).to(x.dtype)
-        k = attn.to_k(ctx)
-        t_k = _linear_tangent(attn.to_k, ctx_t.float()).to(x.dtype)
-        v = attn.to_v(ctx)
-        t_v = _linear_tangent(attn.to_v, ctx_t.float()).to(x.dtype)
-
-        q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
-        k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
-
-        if pe is not None:
-            out_q, t_out_q = torch.func.jvp(
-                lambda z: apply_rotary_emb(z, pe, attn.rope_type), (q.float(),), (t_q.float(),))
-            q, t_q = out_q.to(x.dtype), t_out_q.detach().to(x.dtype)
-            pe_k = pe if k_pe is None else k_pe
-            out_k, t_out_k = torch.func.jvp(
-                lambda z: apply_rotary_emb(z, pe_k, attn.rope_type), (k.float(),), (t_k.float(),))
-            k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
-
-        def _attn_fn(qq, kk, vv):
-            return attn.attention_function(qq, kk, vv, attn.heads, mask)
-        attn_out, t_attn_out = torch.func.jvp(
-            _attn_fn, (q.float(), k.float(), v.float()), (t_q.float(), t_k.float(), t_v.float()))
-        attn_out = attn_out.to(x.dtype)
-        t_attn_out = t_attn_out.detach().to(x.dtype)
-
-        out = attn.to_out(attn_out)
-        t_out = _linear_tangent(attn.to_out[0], t_attn_out.float()).to(x.dtype)
-        return out, t_out
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
