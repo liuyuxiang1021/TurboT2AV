@@ -113,32 +113,79 @@ def _attention_with_t(
     pe: torch.Tensor | None,
     k_pe: torch.Tensor | None,
 ):
-    attention = _unwrap_fsdp(attention)
+    """rCM-aligned: decompose attention, compute Linear tangents in FP32."""
+    attn = _unwrap_fsdp(attention)
+
+    # Cross-attention with only query tangent → keep bf16 (shape safety)
+    if context is not None and t_context is None:
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            return _single_input_jvp(
+                lambda xx: attn(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
+                x, t_x)
+
     with sdpa_kernel(backends=[SDPBackend.MATH]):
-        if context is None:
-            return _single_input_jvp(
-                lambda xx: attention(xx, context=None, mask=mask, pe=pe, k_pe=k_pe),
-                x,
-                t_x,
-            )
-        if t_context is None:
-            return _single_input_jvp(
-                lambda xx: attention(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
-                x,
-                t_x,
-            )
-        return _two_input_jvp(
-            lambda xx, cc: attention(xx, context=cc, mask=mask, pe=pe, k_pe=k_pe),
-            x,
-            context,
-            t_x,
-            t_context,
+        ctx = x if context is None else context
+        ctx_t = t_x if context is None else t_context
+
+        # QKV projection tangents: FP32
+        q = attn.to_q(x)
+        t_q = _linear_tangent(attn.to_q, t_x)
+        k = attn.to_k(ctx)
+        t_k = _linear_tangent(attn.to_k, ctx_t)
+        v = attn.to_v(ctx)
+        t_v = _linear_tangent(attn.to_v, ctx_t)
+
+        # RMS norm JVP: FP32 (no weights)
+        q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
+        k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
+
+        # RoPE JVP: FP32 (no weights)
+        if pe is not None:
+            out_q, t_out_q = torch.func.jvp(
+                lambda z: apply_rotary_emb(z, pe, attn.rope_type),
+                (q.float(),), (t_q.float(),))
+            q, t_q = out_q.to(x.dtype), t_out_q.detach().to(x.dtype)
+            pe_k = pe if k_pe is None else k_pe
+            out_k, t_out_k = torch.func.jvp(
+                lambda z: apply_rotary_emb(z, pe_k, attn.rope_type),
+                (k.float(),), (t_k.float(),))
+            k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
+
+        # SDPA JVP: FP32 (no weights)
+        def _attn_fn(qq, kk, vv):
+            return attn.attention_function(qq, kk, vv, attn.heads, mask)
+        attn_out, t_attn_out = torch.func.jvp(
+            _attn_fn,
+            (q.float(), k.float(), v.float()),
+            (t_q.float(), t_k.float(), t_v.float()),
         )
+        attn_out = attn_out.to(x.dtype)
+        t_attn_out = t_attn_out.detach().to(x.dtype)
+
+        # Output projection tangent: FP32
+        out = attn.to_out(attn_out)
+        t_out = _linear_tangent(attn.to_out[0], t_attn_out)
+        return out, t_out
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
+    """rCM-aligned: decompose FFN, compute Linear tangents in FP32."""
     ff = _unwrap_fsdp(ff)
-    return _single_input_jvp(ff, x, t_x)
+    gelu_approx = ff.net[0]   # GELUApprox: Linear + GELU
+    project_out = ff.net[2]   # Linear
+
+    # Layer 1 Linear tangent: FP32
+    y = gelu_approx.proj(x)
+    t_y = _linear_tangent(gelu_approx.proj, t_x)
+    # GELU activation JVP: FP32 (no weights)
+    y, t_y = torch.func.jvp(
+        lambda z: torch.nn.functional.gelu(z, approximate="tanh"),
+        (y.float(),), (t_y.float(),))
+    y, t_y = y.to(x.dtype), t_y.detach().to(x.dtype)
+    # Layer 2 Linear tangent: FP32
+    out = F.linear(y, project_out.weight, project_out.bias)
+    t_out = _linear_tangent(project_out, t_y)
+    return out, t_out
 
 
 def _layer_norm_with_t(norm: torch.nn.LayerNorm, x: torch.Tensor, t_x: torch.Tensor):
