@@ -109,20 +109,20 @@ def _attention_with_t(
     pe: torch.Tensor | None,
     k_pe: torch.Tensor | None,
 ):
-    """Manual FP32 attention JVP — aligned with rCM's flash_attention_jvp_triton approach.
-
-    Decomposes attention into QKV/projection (Linear with manual fp32 tangent)
-    and norm/attention (FP32 torch.func.jvp). This avoids bf16 precision loss
-    in the 40-layer tangent propagation chain.
-    """
+    """Manual FP32 attention JVP — aligned with rCM's flash_attention_jvp_triton approach."""
     attn = _unwrap_fsdp(attention)
-    ctx = x if context is None else context
-    ctx_t = t_x if t_context is None else t_context
+
+    # When context has no tangent (cross-attn with fixed audio), fall back
+    # to original single-input JVP — only differentiate through query.
+    if context is not None and t_context is None:
+        return _single_input_jvp(
+            lambda xx: attn(xx, context=context, mask=mask, pe=pe, k_pe=k_pe),
+            x, t_x)
 
     with sdpa_kernel(backends=[SDPBackend.MATH]):
-        # ---- Forward pass (bf16 for memory) + Tangent (fp32 for precision) ----
+        ctx = x if context is None else context
+        ctx_t = t_x if t_context is None else t_context
 
-        # QKV projections: manual fp32 linear tangent
         q = attn.to_q(x)
         t_q = _linear_tangent(attn.to_q, t_x.float()).to(x.dtype)
         k = attn.to_k(ctx)
@@ -130,23 +130,18 @@ def _attention_with_t(
         v = attn.to_v(ctx)
         t_v = _linear_tangent(attn.to_v, ctx_t.float()).to(x.dtype)
 
-        # RMS norm: fp32 JVP (no weights, safe)
         q, t_q = _rms_norm_with_t(q, t_q, attn.q_norm.normalized_shape[0])
         k, t_k = _rms_norm_with_t(k, t_k, attn.k_norm.normalized_shape[0])
 
-        # RoPE: fp32 JVP (no weights, safe)
         if pe is not None:
             out_q, t_out_q = torch.func.jvp(
-                lambda z: apply_rotary_emb(z, pe, attn.rope_type),
-                (q.float(),), (t_q.float(),))
+                lambda z: apply_rotary_emb(z, pe, attn.rope_type), (q.float(),), (t_q.float(),))
             q, t_q = out_q.to(x.dtype), t_out_q.detach().to(x.dtype)
             pe_k = pe if k_pe is None else k_pe
             out_k, t_out_k = torch.func.jvp(
-                lambda z: apply_rotary_emb(z, pe_k, attn.rope_type),
-                (k.float(),), (t_k.float(),))
+                lambda z: apply_rotary_emb(z, pe_k, attn.rope_type), (k.float(),), (t_k.float(),))
             k, t_k = out_k.to(x.dtype), t_out_k.detach().to(x.dtype)
 
-        # SDPA: attention function with fp32 JVP (no weights, safe)
         def _attn_fn(qq, kk, vv):
             return attn.attention_function(qq, kk, vv, attn.heads, mask)
         attn_out, t_attn_out = torch.func.jvp(
@@ -154,24 +149,22 @@ def _attention_with_t(
         attn_out = attn_out.to(x.dtype)
         t_attn_out = t_attn_out.detach().to(x.dtype)
 
-        # Output projection: manual fp32 linear tangent
         out = attn.to_out(attn_out)
         t_out = _linear_tangent(attn.to_out[0], t_attn_out.float()).to(x.dtype)
-
         return out, t_out
 
 
 def _feed_forward_with_t(ff: FeedForward, x: torch.Tensor, t_x: torch.Tensor):
     """Manual FP32 FFN JVP — decomposed Linear layers with fp32 tangent."""
     ff = _unwrap_fsdp(ff)
-    project_in = ff.net[0]  # GELUApprox: Linear + GELU activation
+    gelu_approx = ff.net[0]  # GELUApprox: Linear + GELU
     project_out = ff.net[2]  # Linear
 
-    # Layer 1: Linear part
-    y = F.linear(x, project_in.weight, project_in.bias)
-    t_y = _linear_tangent(project_in, t_x.float()).to(x.dtype)
-    # GELU activation
-    y, t_y = _single_input_jvp(project_in.act, y, t_y)
+    # Layer 1: Linear (via GELUApprox.proj)
+    y = gelu_approx.proj(x)
+    t_y = _linear_tangent(gelu_approx.proj, t_x.float()).to(x.dtype)
+    # GELU activation: fp32 JVP
+    y, t_y = _single_input_jvp(lambda z: torch.nn.functional.gelu(z, approximate="tanh"), y, t_y)
     # Layer 2: Linear
     out = F.linear(y, project_out.weight, project_out.bias)
     t_out = _linear_tangent(project_out, t_y.float()).to(x.dtype)
