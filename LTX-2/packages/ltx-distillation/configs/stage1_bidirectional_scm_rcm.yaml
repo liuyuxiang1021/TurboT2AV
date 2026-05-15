@@ -36,10 +36,10 @@ scm_p_G_std: 1.6
 scm_consistency_boost: 3.5       # boost F_sg-F_teacher term to balance t_F/gap ratio (~15→~4.5)
 scm_fd_type: 0                   # full JVP (exact sCM)
 scm_fd_size: 0.0001
-scm_tangent_warmup: 1000         # rCM SCM-only: gradual warmup over 1000 steps
+scm_tangent_warmup: 300          # shorter warmup: get cs*xt term active sooner for stability
 scm_strict_rcm: true
 scm_diagnostic_mode: false
-scm_tangent_clip_mean: 0         # no tangent clipping (matching rCM)
+scm_tangent_clip_mean: 20.0      # p99 clip: prevent single extreme-t_F sample from breaking training
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
 scm_g_normalization: per_modality  # video-only: per_modality = joint equivalent
