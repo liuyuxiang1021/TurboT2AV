@@ -36,7 +36,7 @@ scm_p_G_std: 1.6
 scm_consistency_boost: 3.5       # boost F_sg-F_teacher term to balance t_F/gap ratio (~15→~4.5)
 scm_fd_type: 0                   # full JVP (exact sCM)
 scm_fd_size: 0.0001
-scm_tangent_warmup: 300          # shorter warmup: get cs*xt term active sooner for stability
+scm_tangent_warmup: 0            # no warmup needed with boost+clip
 scm_strict_rcm: true
 scm_diagnostic_mode: false
 scm_tangent_clip_mean: 20.0      # p99 clip: prevent single extreme-t_F sample from breaking training
