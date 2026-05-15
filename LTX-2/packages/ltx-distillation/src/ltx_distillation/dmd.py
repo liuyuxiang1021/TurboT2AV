@@ -2623,7 +2623,12 @@ class LTX2DMD(nn.Module):
         video_geom_coeff = cos_t_video * torch.sqrt(
             (1 - warmup_ratio ** 2 * sin_t_video ** 2).clamp_min(0.0)
         )
-        g_video = -self.scm_consistency_boost * video_geom_coeff * (F_theta_video_sg - F_teacher_video) - (
+        # Dual normalization: consistency and tangent terms normalized separately,
+        # then combined with equal weight. Prevents t_F from dominating gradient direction.
+        g_video_consistency = -self.scm_consistency_boost * video_geom_coeff * (
+            F_theta_video_sg - F_teacher_video
+        )
+        g_video_tangent = -(
             warmup_ratio * cs_video * xt_video + t_F_theta_video
         )
 
@@ -2631,91 +2636,103 @@ class LTX2DMD(nn.Module):
             audio_geom_coeff = cos_t_audio * torch.sqrt(
                 (1 - warmup_ratio ** 2 * sin_t_audio ** 2).clamp_min(0.0)
             )
-            g_audio = -self.scm_consistency_boost * audio_geom_coeff * (F_theta_audio_sg - F_teacher_audio) - (
+            g_audio_consistency = -self.scm_consistency_boost * audio_geom_coeff * (
+                F_theta_audio_sg - F_teacher_audio
+            )
+            g_audio_tangent = -(
                 warmup_ratio * cs_audio * xt_audio + t_F_theta_audio
             )
         else:
-            g_audio = None
+            g_audio_consistency = None
+            g_audio_tangent = None
 
         with torch.no_grad():
-            video_nan_mask = (
-                torch.isnan(g_video).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
-                | torch.isnan(F_theta_video).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
-                | video_tangent_reject_mask
+            video_nan_mask_cons = (
+                torch.isnan(g_video_consistency).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
             )
+            video_nan_mask_tan = (
+                torch.isnan(g_video_tangent).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
+            )
+            video_nan_mask_F = (
+                torch.isnan(F_theta_video).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1)
+            )
+            video_nan_mask = video_nan_mask_cons | video_nan_mask_tan | video_nan_mask_F | video_tangent_reject_mask
             if has_audio:
-                audio_nan_mask = (
-                    torch.isnan(g_audio).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
-                    | torch.isnan(F_theta_audio).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
-                    | audio_tangent_reject_mask
+                audio_nan_mask_cons = (
+                    torch.isnan(g_audio_consistency).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
                 )
+                audio_nan_mask_tan = (
+                    torch.isnan(g_audio_tangent).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
+                )
+                audio_nan_mask_F = (
+                    torch.isnan(F_theta_audio).flatten(start_dim=1).any(dim=1).view(B, 1, 1)
+                )
+                audio_nan_mask = audio_nan_mask_cons | audio_nan_mask_tan | audio_nan_mask_F | audio_tangent_reject_mask
             else:
                 audio_nan_mask = None
 
-        g_video_pre_norm = g_video.detach()
-        g_video = torch.where(video_nan_mask, torch.zeros_like(g_video), g_video)
+        g_video_consistency = torch.where(video_nan_mask, torch.zeros_like(g_video_consistency), g_video_consistency)
+        g_video_tangent = torch.where(video_nan_mask, torch.zeros_like(g_video_tangent), g_video_tangent)
         F_theta_video = torch.where(video_nan_mask, torch.zeros_like(F_theta_video), F_theta_video)
         F_theta_video_sg = torch.where(video_nan_mask, torch.zeros_like(F_theta_video_sg), F_theta_video_sg)
 
         if has_audio:
-            g_audio_pre_norm = g_audio.detach()
-            g_audio = torch.where(audio_nan_mask, torch.zeros_like(g_audio), g_audio)
+            g_audio_consistency = torch.where(audio_nan_mask, torch.zeros_like(g_audio_consistency), g_audio_consistency)
+            g_audio_tangent = torch.where(audio_nan_mask, torch.zeros_like(g_audio_tangent), g_audio_tangent)
             F_theta_audio = torch.where(audio_nan_mask, torch.zeros_like(F_theta_audio), F_theta_audio)
             F_theta_audio_sg = torch.where(audio_nan_mask, torch.zeros_like(F_theta_audio_sg), F_theta_audio_sg)
+
+        g_video_pre_norm = (g_video_consistency + g_video_tangent).detach()
+        if has_audio:
+            g_audio_pre_norm = (g_audio_consistency + g_audio_tangent).detach()
         else:
             g_audio_pre_norm = None
 
         video_w, audio_w = self.get_loss_weights()
         active_audio = has_audio and float(audio_w) != 0.0
 
-        if self.scm_g_normalization == "joint":
-            joint_g_norm_sq = g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False)
-            if active_audio:
-                joint_g_norm_sq = joint_g_norm_sq + g_audio.double().square().sum(dim=(1, 2), keepdim=False)
-            video_g_norm = torch.sqrt(joint_g_norm_sq).view(B, 1, 1, 1, 1) + 0.1
-            audio_g_norm = video_g_norm.view(B, 1, 1)
-        elif self.scm_g_normalization == "per_frame":
-            T_vid = g_video.shape[2]
-            video_g_norm = (
-                torch.sqrt(g_video.double().square().sum(dim=(1, 3, 4), keepdim=False))
-                .view(B, 1, T_vid, 1, 1)
-                + 0.1
-            )
-            if active_audio:
-                audio_g_norm = (
-                    torch.sqrt(g_audio.double().square().sum(dim=(1, 2), keepdim=False))
-                    .view(B, 1, 1)
-                    + 0.1
-                )
-            else:
-                audio_g_norm = video_g_norm.mean(dim=2, keepdim=True).view(B, 1, 1)
-        else:
-            video_g_norm = (
-                torch.sqrt(g_video.double().square().sum(dim=(1, 2, 3, 4), keepdim=False))
-                .view(B, 1, 1, 1, 1)
-                + 0.1
-            )
-            if active_audio:
-                audio_g_norm = (
-                    torch.sqrt(g_audio.double().square().sum(dim=(1, 2), keepdim=False))
-                    .view(B, 1, 1)
-                    + 0.1
-                )
-            else:
-                audio_g_norm = video_g_norm.view(B, 1, 1)
+        # Dual normalization: each component normalized independently
+        video_cons_norm = (
+            torch.sqrt(g_video_consistency.double().square().sum(dim=(1, 2, 3, 4), keepdim=False))
+            .view(B, 1, 1, 1, 1) + 0.1
+        )
+        video_tan_norm = (
+            torch.sqrt(g_video_tangent.double().square().sum(dim=(1, 2, 3, 4), keepdim=False))
+            .view(B, 1, 1, 1, 1) + 0.1
+        )
 
-        g_video = g_video.double() / video_g_norm
+        if active_audio:
+            audio_cons_norm = (
+                torch.sqrt(g_audio_consistency.double().square().sum(dim=(1, 2), keepdim=False))
+                .view(B, 1, 1) + 0.1
+            )
+            audio_tan_norm = (
+                torch.sqrt(g_audio_tangent.double().square().sum(dim=(1, 2), keepdim=False))
+                .view(B, 1, 1) + 0.1
+            )
+        else:
+            audio_cons_norm = None
+            audio_tan_norm = None
+
+        g_video = (
+            g_video_consistency.double() / video_cons_norm
+            + g_video_tangent.double() / video_tan_norm
+        )
 
         video_loss_scm_per_sample = (
             (F_theta_video.double() - F_theta_video_sg.double() - g_video) ** 2
         ).sum(dim=(1, 2, 3, 4))
 
         if active_audio:
-            g_audio = g_audio.double() / audio_g_norm
+            g_audio = (
+                g_audio_consistency.double() / audio_cons_norm
+                + g_audio_tangent.double() / audio_tan_norm
+            )
             audio_loss_scm_per_sample = (
                 (F_theta_audio.double() - F_theta_audio_sg.double() - g_audio) ** 2
             ).sum(dim=(1, 2))
         else:
+            g_audio = None
             audio_loss_scm_per_sample = video_loss_scm_per_sample.new_zeros(B)
 
         video_loss_scm = video_loss_scm_per_sample.mean()
