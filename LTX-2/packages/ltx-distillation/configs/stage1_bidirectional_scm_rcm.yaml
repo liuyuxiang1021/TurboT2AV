@@ -33,8 +33,8 @@ scm_weight: 1.0
 scm_loss_scale: 100.0
 scm_p_G_mean: -0.8              # Lower sigma → stronger cos(t) → consistency dominant
 scm_p_G_std: 1.6
-scm_fd_type: 1
-scm_fd_size: 0.0001
+scm_fd_type: 2
+scm_fd_size: 0.00005             # smaller interval → closer to continuous
 scm_tangent_warmup: 0            # rCM 4.2: not needed for large models with FP32 time
 scm_strict_rcm: false            # required for fd_type != 0
 scm_diagnostic_mode: false
@@ -91,7 +91,7 @@ benchmark_num_prompts: 8
 
 wandb_project: OmniForcing
 wandb_entity: liuyuxiang1021-tianjin-university
-wandb_name: scm_fd1_semi_continuous
+wandb_name: dcm_fd2_fine_interval
 wandb_api_key: "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"
 
 seed: 42
