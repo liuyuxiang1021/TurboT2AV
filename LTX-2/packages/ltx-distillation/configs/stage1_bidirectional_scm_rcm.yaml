@@ -17,7 +17,7 @@ dmd_p_D_shift: 5.0
 backward_trig_timesteps: [1.5, 1.4, 1.0]
 denoising_step_list: [1000, 757, 522, 0]
 num_train_timestep: 1000
-real_video_guidance_scale: 3.0
+real_video_guidance_scale: 5.0
 real_audio_guidance_scale: 5.0
 denoising_loss_type: velocity
 distillation_loss: dmd
@@ -31,21 +31,21 @@ scm_enabled: true
 scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/omniforcing_latent_100k
 scm_weight: 1.0
 scm_loss_scale: 100.0
-scm_p_G_mean: -0.8              # Lower sigma → stronger cos(t) → consistency dominant
+scm_p_G_mean: 0.7               # rCM default: median sigma=exp(0.7)≈2.0 → noise-dominant
 scm_p_G_std: 1.6
-scm_fd_type: 2
-scm_fd_size: 0.00005             # smaller interval → closer to continuous
-scm_tangent_warmup: 0            # rCM 4.2: not needed for large models with FP32 time
-scm_strict_rcm: false            # required for fd_type != 0
+scm_fd_type: 0                   # full JVP (exact sCM)
+scm_fd_size: 0.0001
+scm_tangent_warmup: 1000         # rCM SCM-only: gradual warmup over 1000 steps
+scm_strict_rcm: true
 scm_diagnostic_mode: false
-scm_tangent_clip_mean: 20.0       # p99-based clipping threshold (acts on per-sample p99 of |t_F|)
+scm_tangent_clip_mean: 0         # no tangent clipping (matching rCM)
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
-scm_g_normalization: per_modality
+scm_g_normalization: joint       # rCM-style: all dims in one norm
 
 # ===== Optimizer (rCM config) =====
-lr: 1.0e-05
-generator_lr: 1.0e-05
+lr: 2.0e-06
+generator_lr: 2.0e-06
 critic_lr: 4.0e-07
 beta1: 0.0
 beta2: 0.999
@@ -91,7 +91,7 @@ benchmark_num_prompts: 8
 
 wandb_project: OmniForcing
 wandb_entity: liuyuxiang1021-tianjin-university
-wandb_name: dcm_fd2_fine_interval
+wandb_name: scm_rcm_exact_align
 wandb_api_key: "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"
 
 seed: 42
