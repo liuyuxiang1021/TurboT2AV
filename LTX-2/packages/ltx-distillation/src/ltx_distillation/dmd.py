@@ -2786,22 +2786,22 @@ class LTX2DMD(nn.Module):
         if has_audio:
             log_dict["alignment/scm_audio_teacher_norm"] = torch.mean(torch.abs(F_teacher_audio)).item()
             log_dict["alignment/scm_audio_student_norm"] = torch.mean(torch.abs(F_theta_audio_sg)).item()
-            log_dict["alignment/scm_audio_g_norm"] = torch.mean(torch.abs(g_audio_pre_norm)).item()
-            log_dict["alignment/scm_audio_g_post_norm"] = torch.mean(torch.abs(g_audio)).item()
+            log_dict["alignment/scm_audio_g_norm"] = torch.mean(torch.abs(g_audio_pre_norm)).item() if g_audio_pre_norm is not None else 0.0
+            log_dict["alignment/scm_audio_g_post_norm"] = torch.mean(torch.abs(g_audio)).item() if g_audio is not None else 0.0
             log_dict["alignment/scm_audio_loss_share"] = torch.mean(
                 audio_loss_scm_per_sample / loss_share_denom
             ).item()
-            log_dict["alignment/scm_audio_nan_ratio"] = audio_nan_mask.float().mean().item()
+            log_dict["alignment/scm_audio_nan_ratio"] = audio_nan_mask.float().mean().item() if audio_nan_mask is not None else 0.0
             log_dict["alignment/scm_audio_direction_gap"] = torch.mean(
                 torch.abs(F_theta_audio_sg - F_teacher_audio)
             ).item()
             log_dict["alignment/scm_audio_tangent_norm"] = torch.mean(
                 torch.abs(t_F_theta_audio)
             ).item()
-            log_dict["alignment/scm_audio_tangent_p99"] = audio_tangent_raw_p99.item()
-            log_dict["alignment/scm_audio_tangent_raw_norm"] = audio_tangent_raw_mean.item()
-            log_dict["alignment/scm_audio_tangent_clip_scale"] = audio_tangent_clip_scale.item()
-            log_dict["alignment/scm_audio_tangent_reject_ratio"] = audio_tangent_reject_mask.float().mean().item()
+            log_dict["alignment/scm_audio_tangent_p99"] = audio_tangent_raw_p99.item() if audio_tangent_raw_p99 is not None else 0.0
+            log_dict["alignment/scm_audio_tangent_raw_norm"] = audio_tangent_raw_mean.item() if audio_tangent_raw_mean is not None else 0.0
+            log_dict["alignment/scm_audio_tangent_clip_scale"] = (audio_tangent_clip_scale.item() if audio_tangent_clip_scale is not None else 1.0)
+            log_dict["alignment/scm_audio_tangent_reject_ratio"] = (audio_tangent_reject_mask.float().mean().item() if audio_tangent_reject_mask is not None else 0.0)
 
         return total_scm_loss, log_dict
 
