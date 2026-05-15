@@ -33,6 +33,7 @@ scm_weight: 1.0
 scm_loss_scale: 100.0
 scm_p_G_mean: 0.7               # rCM default: median sigma=exp(0.7)≈2.0 → noise-dominant
 scm_p_G_std: 1.6
+scm_consistency_boost: 3.5       # boost F_sg-F_teacher term to balance t_F/gap ratio (~15→~4.5)
 scm_fd_type: 0                   # full JVP (exact sCM)
 scm_fd_size: 0.0001
 scm_tangent_warmup: 1000         # rCM SCM-only: gradual warmup over 1000 steps

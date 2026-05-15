@@ -201,6 +201,7 @@ class LTX2DMD(nn.Module):
         # Align SCM time sampling with the original rCM implementation.
         self.scm_p_G_mean = float(getattr(args, "scm_p_G_mean", -0.8))
         self.scm_p_G_std = float(getattr(args, "scm_p_G_std", 1.6))
+        self.scm_consistency_boost = float(getattr(args, "scm_consistency_boost", 1.0))
         # fd_type semantics from the original rCM code:
         #   0 -> SCM JVP path
         #   1 -> semi-continuous hybrid ablation
@@ -2622,7 +2623,7 @@ class LTX2DMD(nn.Module):
         video_geom_coeff = cos_t_video * torch.sqrt(
             (1 - warmup_ratio ** 2 * sin_t_video ** 2).clamp_min(0.0)
         )
-        g_video = -video_geom_coeff * (F_theta_video_sg - F_teacher_video) - (
+        g_video = -self.scm_consistency_boost * video_geom_coeff * (F_theta_video_sg - F_teacher_video) - (
             warmup_ratio * cs_video * xt_video + t_F_theta_video
         )
 
@@ -2630,7 +2631,7 @@ class LTX2DMD(nn.Module):
             audio_geom_coeff = cos_t_audio * torch.sqrt(
                 (1 - warmup_ratio ** 2 * sin_t_audio ** 2).clamp_min(0.0)
             )
-            g_audio = -audio_geom_coeff * (F_theta_audio_sg - F_teacher_audio) - (
+            g_audio = -self.scm_consistency_boost * audio_geom_coeff * (F_theta_audio_sg - F_teacher_audio) - (
                 warmup_ratio * cs_audio * xt_audio + t_F_theta_audio
             )
         else:
