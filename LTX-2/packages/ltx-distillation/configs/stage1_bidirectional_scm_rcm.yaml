@@ -41,7 +41,9 @@ scm_diagnostic_mode: false
 scm_tangent_clip_mean: 0         # no tangent clipping (matching rCM)
 scm_time_eps: 0.0001
 scm_jvp_impl: internal
-scm_g_normalization: joint       # rCM-style: all dims in one norm
+scm_g_normalization: per_modality  # video-only: per_modality = joint equivalent
+video_loss_weight: 1.0
+audio_loss_weight: 0              # disable audio SCM, video only
 
 # ===== Optimizer (rCM config) =====
 lr: 2.0e-05
