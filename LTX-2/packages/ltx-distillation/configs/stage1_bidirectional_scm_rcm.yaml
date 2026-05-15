@@ -44,7 +44,7 @@ scm_time_eps: 0.0001
 scm_jvp_impl: internal
 scm_g_normalization: per_modality  # video-only: per_modality = joint equivalent
 video_loss_weight: 1.0
-audio_loss_weight: 1              # full audio-visual SCM
+audio_loss_weight: 0              # video-only; AV needs separate investigation
 
 # ===== Optimizer (rCM config) =====
 lr: 2.0e-05
