@@ -1252,12 +1252,16 @@ class Trainer:
             ema_state = {k: v.cpu() for k, v in self.dmd.generator.state_dict().items()}
             self.dmd.generator.load_state_dict(ema_sd)
 
+        # Use the same LTX2Scheduler as the teacher benchmark for apples-to-apples
+        # comparison. 4-step student output should match 4-step teacher output.
+        benchmark_sigmas = LTX2Scheduler().execute(steps=4).to(device=self.device, dtype=self.dtype)
+
         try:
             if self.benchmark_mode == "causal":
                 pipeline = CausalAVInferencePipeline(
                     generator=self.dmd.generator,
                     add_noise_fn=self.dmd.add_noise,
-                    denoising_sigmas=self.dmd.denoising_sigmas,
+                    denoising_sigmas=benchmark_sigmas,
                     num_frame_per_block=self.benchmark_num_frame_per_block,
                     use_kv_cache=self.benchmark_use_kv_cache,
                     clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
@@ -1266,7 +1270,7 @@ class Trainer:
                 pipeline = BidirectionalAVInferencePipeline(
                     generator=self.dmd.generator,
                     add_noise_fn=self.dmd.add_noise,
-                    denoising_sigmas=self.dmd.denoising_sigmas,
+                    denoising_sigmas=benchmark_sigmas,
                     use_trigflow=self.dmd.use_rcm_style_dmd,
                 )
 
