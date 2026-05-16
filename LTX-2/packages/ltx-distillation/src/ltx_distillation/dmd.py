@@ -2714,9 +2714,9 @@ class LTX2DMD(nn.Module):
             audio_cons_norm = None
             audio_tan_norm = None
 
-        # Adaptive weighting: consistency weight scales with gap magnitude.
-        # gap large → cons weight high (strong pull toward teacher).
-        # gap small → cons weight low (ODE tangent dominates fine-tuning).
+        # Adaptive weighting + gap-scaled dual normalization.
+        # Direction: unit vectors (dual norm preserves orientation).
+        # Magnitude: scaled by actual ||gap|| so loss reflects distance to teacher.
         with torch.no_grad():
             video_gap_norm = torch.sqrt(
                 (F_theta_video_sg.double() - F_teacher_video.double())
@@ -2725,10 +2725,11 @@ class LTX2DMD(nn.Module):
             video_cons_weight = video_gap_norm / (video_gap_norm + 0.1)
             video_tan_weight = 1.0 - video_cons_weight
 
-        g_video = (
+        g_video_direction = (
             video_cons_weight * g_video_consistency.double() / video_cons_norm
             + video_tan_weight * g_video_tangent.double() / video_tan_norm
         )
+        g_video = video_gap_norm * g_video_direction
 
         video_loss_scm_per_sample = (
             (F_theta_video.double() - F_theta_video_sg.double() - g_video) ** 2
@@ -2743,10 +2744,11 @@ class LTX2DMD(nn.Module):
                 audio_cons_weight = audio_gap_norm / (audio_gap_norm + 0.1)
                 audio_tan_weight = 1.0 - audio_cons_weight
 
-            g_audio = (
+            g_audio_direction = (
                 audio_cons_weight * g_audio_consistency.double() / audio_cons_norm
                 + audio_tan_weight * g_audio_tangent.double() / audio_tan_norm
             )
+            g_audio = audio_gap_norm * g_audio_direction
             audio_loss_scm_per_sample = (
                 (F_theta_audio.double() - F_theta_audio_sg.double() - g_audio) ** 2
             ).sum(dim=(1, 2))
