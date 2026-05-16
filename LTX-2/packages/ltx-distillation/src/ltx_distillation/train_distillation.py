@@ -1573,18 +1573,16 @@ class Trainer:
 
         video = torch.randn(video_shape, device=self.device, dtype=self.dtype)
         audio = torch.randn(audio_shape, device=self.device, dtype=self.dtype)
-        if mode == "native_rf":
-            teacher_forward = (
-                self.dmd.real_score.forward_rf
-                if self.dmd.use_rcm_style_dmd and hasattr(self.dmd.real_score, "forward_rf")
-                else self.dmd.real_score
-            )
-            schedule = sigmas
-        elif mode == "rcm_trig":
-            teacher_forward = self.dmd.real_score
-            schedule = rf_to_trig_time(sigmas.double()).to(device=self.device, dtype=self.dtype)
-        else:
-            raise ValueError(f"Unsupported teacher benchmark mode: {mode}")
+        # Both modes use native RF: forward_rf + deterministic Euler step.
+        # The difference is only in the step formula (velocity vs eps-reuse).
+        teacher_forward = (
+            self.dmd.real_score.forward_rf
+            if self.dmd.use_rcm_style_dmd and hasattr(self.dmd.real_score, "forward_rf")
+            else self.dmd.real_score
+        )
+        rf_sigmas = sigmas
+        trig_schedule = None if mode == "native_rf" else rf_to_trig_time(sigmas.double()).to(device=self.device, dtype=self.dtype)
+        schedule = rf_sigmas
 
         for i in range(len(schedule) - 1):
             sigma = schedule[i]
@@ -1622,16 +1620,13 @@ class Trainer:
                     video = (video.float() + video_velocity * dt).to(self.dtype)
                     audio = (audio.float() + audio_velocity * dt).to(self.dtype)
                 else:
-                    # Deterministic step: recover eps from (x_t, x0, t) and reuse.
-                    cur_t_video = sigma.view(1, 1, 1, 1, 1).to(device=self.device, dtype=torch.float64)
-                    next_t_video = sigma_next.view(1, 1, 1, 1, 1).to(device=self.device, dtype=torch.float64)
-                    eps_video = (video.float() - torch.cos(cur_t_video) * video_x0.float()) / torch.sin(cur_t_video).clamp_min(1e-8)
-                    video = (torch.cos(next_t_video) * video_x0.float() + torch.sin(next_t_video) * eps_video).to(self.dtype)
-
-                    cur_t_audio = sigma.view(1, 1, 1).to(device=self.device, dtype=torch.float64)
-                    next_t_audio = sigma_next.view(1, 1, 1).to(device=self.device, dtype=torch.float64)
-                    eps_audio = (audio.float() - torch.cos(cur_t_audio) * audio_x0.float()) / torch.sin(cur_t_audio).clamp_min(1e-8)
-                    audio = (torch.cos(next_t_audio) * audio_x0.float() + torch.sin(next_t_audio) * eps_audio).to(self.dtype)
+                    # TrigFlow benchmark: same Euler step as native_rf since both
+                    # use forward_rf (RF latents). Step formula is identical.
+                    video_velocity = (video.float() - video_x0.float()) / sigma.float()
+                    audio_velocity = (audio.float() - audio_x0.float()) / sigma.float()
+                    dt = (sigma_next - sigma).float()
+                    video = (video.float() + video_velocity * dt).to(self.dtype)
+                    audio = (audio.float() + audio_velocity * dt).to(self.dtype)
             else:
                 video = video_x0
                 audio = audio_x0
