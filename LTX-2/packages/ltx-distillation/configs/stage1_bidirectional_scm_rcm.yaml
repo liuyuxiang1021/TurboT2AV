@@ -31,9 +31,9 @@ scm_enabled: true
 scm_data_path: /data/datasets/turbodiff_datasets_and_ckpt/tavgbench/omniforcing_latent_100k
 scm_weight: 1.0
 scm_loss_scale: 100.0
-scm_p_G_mean: 0.7               # rCM default: median sigma=exp(0.7)≈2.0 → noise-dominant
+scm_p_G_mean: 1.5               # rCM 14B: median sigma=exp(1.5)≈4.5, noise-dominant
 scm_p_G_std: 1.6
-scm_consistency_boost: 1.0       # dual norm handles balance; boost=1 for natural scale
+scm_consistency_boost: 1.0       # rCM-style single norm, no boost needed
 scm_fd_type: 0                   # full JVP (exact sCM)
 scm_fd_size: 0.0001
 scm_tangent_warmup: 0            # no warmup needed with boost+clip
@@ -47,8 +47,8 @@ video_loss_weight: 1.0
 audio_loss_weight: 1              # full AV with dual normalization
 
 # ===== Optimizer (rCM config) =====
-lr: 4.0e-05
-generator_lr: 4.0e-05
+lr: 1.0e-06
+generator_lr: 1.0e-06
 critic_lr: 4.0e-07
 beta1: 0.0
 beta2: 0.999
