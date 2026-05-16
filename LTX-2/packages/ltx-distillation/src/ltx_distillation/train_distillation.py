@@ -1622,16 +1622,16 @@ class Trainer:
                     video = (video.float() + video_velocity * dt).to(self.dtype)
                     audio = (audio.float() + audio_velocity * dt).to(self.dtype)
                 else:
-                    next_t_video = sigma_next.view(1, 1, 1, 1, 1).to(device=self.device, dtype=self.dtype)
-                    next_t_audio = sigma_next.view(1, 1, 1).to(device=self.device, dtype=self.dtype)
-                    video = (
-                        torch.cos(next_t_video) * video_x0
-                        + torch.sin(next_t_video) * torch.randn_like(video)
-                    ).to(self.dtype)
-                    audio = (
-                        torch.cos(next_t_audio) * audio_x0
-                        + torch.sin(next_t_audio) * torch.randn_like(audio)
-                    ).to(self.dtype)
+                    # Deterministic step: recover eps from (x_t, x0, t) and reuse.
+                    cur_t_video = sigma.view(1, 1, 1, 1, 1).to(device=self.device, dtype=torch.float64)
+                    next_t_video = sigma_next.view(1, 1, 1, 1, 1).to(device=self.device, dtype=torch.float64)
+                    eps_video = (video.float() - torch.cos(cur_t_video) * video_x0.float()) / torch.sin(cur_t_video).clamp_min(1e-8)
+                    video = (torch.cos(next_t_video) * video_x0.float() + torch.sin(next_t_video) * eps_video).to(self.dtype)
+
+                    cur_t_audio = sigma.view(1, 1, 1).to(device=self.device, dtype=torch.float64)
+                    next_t_audio = sigma_next.view(1, 1, 1).to(device=self.device, dtype=torch.float64)
+                    eps_audio = (audio.float() - torch.cos(cur_t_audio) * audio_x0.float()) / torch.sin(cur_t_audio).clamp_min(1e-8)
+                    audio = (torch.cos(next_t_audio) * audio_x0.float() + torch.sin(next_t_audio) * eps_audio).to(self.dtype)
             else:
                 video = video_x0
                 audio = audio_x0
