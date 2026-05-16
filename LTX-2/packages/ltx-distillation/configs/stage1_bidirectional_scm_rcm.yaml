@@ -88,7 +88,7 @@ skip_initial_checkpoint: true
 
 benchmark_enabled: true
 benchmark_min_step: 0
-benchmark_iters: 1
+benchmark_iters: 50
 teacher_benchmark_enabled: true
 benchmark_num_prompts: 8
 
