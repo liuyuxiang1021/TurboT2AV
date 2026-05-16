@@ -215,9 +215,12 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
             audio_rf_latent = noisy_audio
             t_audio_rf_latent = t_noisy_audio.detach().to(dtype=noisy_audio.dtype)
 
+            # Audio uses single scalar timestep, not per-token.
+            audio_t_for_rf = audio_timestep[:, 0] if audio_timestep.dim() == 2 else audio_timestep
+            t_audio_t_for_rf = t_audio_timestep[:, 0] if t_audio_timestep.dim() == 2 else t_audio_timestep
             audio_rf_time_tokens, t_audio_rf_time_tokens = self._rf_time_and_tangent_from_trig(
-                audio_timestep.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
-                t_audio_timestep.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
+                audio_t_for_rf.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
+                t_audio_t_for_rf.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
             )
             if audio_rf_time_tokens.dim() == 2 and audio_rf_time_tokens.shape[1] == 1:
                 audio_rf_time_tokens = audio_rf_time_tokens[:, 0]
