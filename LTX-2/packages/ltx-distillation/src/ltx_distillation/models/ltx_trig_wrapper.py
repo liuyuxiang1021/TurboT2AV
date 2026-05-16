@@ -282,11 +282,11 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
         video_v = self._unflatten_video_latent(video_v, num_video_frames)
         t_video_v = self._unflatten_video_latent(t_video_v, num_video_frames)
         video_rf_time, t_video_rf_time = self._rf_time_and_tangent_from_trig(
-            video_trig_bcast,
-            t_video_trig_bcast,
+            timestep.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
+            t_timestep.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
         )
-        video_rf_time = video_rf_time.to(dtype=noisy_image_or_video.dtype)
-        t_video_rf_time = t_video_rf_time.detach().to(dtype=noisy_image_or_video.dtype)
+        video_rf_time = self._reshape_time_for_latent(video_rf_time, noisy_image_or_video.dim()).to(dtype=noisy_image_or_video.dtype)
+        t_video_rf_time = self._reshape_time_for_latent(t_video_rf_time, noisy_image_or_video.dim()).detach().to(dtype=noisy_image_or_video.dtype)
 
         video_x0 = (video_rf_latent - video_rf_time * video_v).to(dtype=noisy_image_or_video.dtype)
         t_video_x0 = (t_video_rf_latent - t_video_rf_time * video_v - video_rf_time * t_video_v).to(
