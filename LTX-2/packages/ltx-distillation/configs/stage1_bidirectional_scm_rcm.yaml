@@ -47,8 +47,8 @@ video_loss_weight: 1.0
 audio_loss_weight: 1              # full AV with dual normalization
 
 # ===== Optimizer (rCM config) =====
-lr: 1.0e-06
-generator_lr: 1.0e-06
+lr: 2.0e-05
+generator_lr: 2.0e-05
 critic_lr: 4.0e-07
 beta1: 0.0
 beta2: 0.999
