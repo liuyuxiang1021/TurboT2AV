@@ -155,7 +155,7 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
         t_video_rf_latent = t_noisy_image_or_video.detach().to(dtype=noisy_image_or_video.dtype)
 
         video_rf_time_tokens, t_video_rf_time_tokens = self._rf_time_and_tangent_from_trig(
-            video_trig.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
+            timestep.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
             t_timestep.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
         )
         if video_rf_time_tokens.dim() == 2 and video_rf_time_tokens.shape[1] == 1:
@@ -296,7 +296,7 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
         video_flow, t_video_flow = self._flow_with_t(
             noisy_image_or_video,
             video_x0,
-            video_trig,
+            timestep,
             t_noisy_image_or_video,
             t_video_x0,
             t_timestep,
