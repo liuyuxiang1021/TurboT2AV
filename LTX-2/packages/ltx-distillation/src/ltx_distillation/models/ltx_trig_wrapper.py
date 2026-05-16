@@ -249,8 +249,8 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
             )
 
             audio_rf_time, t_audio_rf_time = self._rf_time_and_tangent_from_trig(
-                audio_timestep.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
-                t_audio_timestep.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
+                audio_t_for_rf.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
+                t_audio_t_for_rf.to(dtype=noisy_audio.dtype, device=noisy_audio.device),
             )
             audio_rf_time = audio_rf_time.to(dtype=noisy_audio.dtype)
             t_audio_rf_time = t_audio_rf_time.detach().to(dtype=noisy_audio.dtype)
