@@ -87,9 +87,17 @@ checkpoint_iters: 500
 skip_initial_checkpoint: true
 
 benchmark_enabled: true
-benchmark_min_step: 1
+benchmark_min_step: 0
 benchmark_iters: 50
-teacher_benchmark_enabled: true
+teacher_benchmark_enabled: false     # skip teacher refs for faster startup; enable for debug
+teacher_benchmark_num_inference_steps: 4
+teacher_benchmark_video_guidance_scale: 5.0
+teacher_benchmark_audio_guidance_scale: 5.0
+teacher_benchmark_mode: rcm_trig
+teacher_benchmark_include_native_rf_reference: true
+teacher_benchmark_include_40step_reference: true
+teacher_benchmark_40step_num_inference_steps: 40
+student_benchmark_use_cfg: false     # SCM distills CFG teacher into conditional student; avoid double CFG at inference.
 benchmark_num_prompts: 8
 
 wandb_project: OmniForcing

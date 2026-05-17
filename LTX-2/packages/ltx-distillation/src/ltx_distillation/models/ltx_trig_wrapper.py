@@ -150,9 +150,24 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
                     f"t_timestep shape {tuple(t_timestep.shape)} must match timestep shape {tuple(timestep.shape)}"
                 )
 
-        # Use raw x_t as RF latent (matching forward_rf convention, no scaling).
-        video_rf_latent = noisy_image_or_video
-        t_video_rf_latent = t_noisy_image_or_video.detach().to(dtype=noisy_image_or_video.dtype)
+        video_trig = timestep
+        video_trig_bcast = self._reshape_time_for_latent(video_trig, noisy_image_or_video.dim()).to(
+            dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device,
+        )
+        t_video_trig_bcast = self._reshape_time_for_latent(t_timestep, noisy_image_or_video.dim()).to(
+            dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device,
+        )
+        # Scale TrigFlow latent back to RF: x_rf = x_trig / (cos+sin).
+        cos_v = torch.cos(video_trig_bcast)
+        sin_v = torch.sin(video_trig_bcast)
+        denom_v = (cos_v + sin_v).clamp_min(1e-8)
+        video_rf_latent = (noisy_image_or_video / denom_v).to(dtype=noisy_image_or_video.dtype)
+        # Tangent of scaled latent: d/dt (x_trig / (cos+sin)).
+        denom_tangent_v = (torch.cos(video_trig_bcast) - torch.sin(video_trig_bcast)) * t_video_trig_bcast
+        t_video_rf_latent = (
+            t_noisy_image_or_video / denom_v
+            - noisy_image_or_video * denom_tangent_v / (denom_v * denom_v)
+        ).detach().to(dtype=noisy_image_or_video.dtype)
 
         video_rf_time_tokens, t_video_rf_time_tokens = self._rf_time_and_tangent_from_trig(
             timestep.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device),
@@ -211,9 +226,22 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
             if t_noisy_audio is None:
                 raise ValueError("t_noisy_audio must be provided when noisy_audio is provided")
 
-            # Use raw audio as RF latent (no scaling, matching forward_rf convention).
-            audio_rf_latent = noisy_audio
-            t_audio_rf_latent = t_noisy_audio.detach().to(dtype=noisy_audio.dtype)
+            # Scale audio TrigFlow latent back to RF: x_rf = x_trig / (cos+sin).
+            audio_trig_bcast = self._reshape_time_for_latent(audio_timestep, noisy_audio.dim()).to(
+                dtype=noisy_audio.dtype, device=noisy_audio.device,
+            )
+            t_audio_trig_bcast = self._reshape_time_for_latent(t_audio_timestep, noisy_audio.dim()).to(
+                dtype=noisy_audio.dtype, device=noisy_audio.device,
+            )
+            cos_a = torch.cos(audio_trig_bcast)
+            sin_a = torch.sin(audio_trig_bcast)
+            denom_a = (cos_a + sin_a).clamp_min(1e-8)
+            audio_rf_latent = (noisy_audio / denom_a).to(dtype=noisy_audio.dtype)
+            audio_denom_tangent = (cos_a - sin_a) * t_audio_trig_bcast
+            t_audio_rf_latent = (
+                t_noisy_audio / denom_a
+                - noisy_audio * audio_denom_tangent / (denom_a * denom_a)
+            ).detach().to(dtype=noisy_audio.dtype)
 
             # Audio uses single scalar timestep, not per-token.
             audio_t_for_rf = audio_timestep[:, 0] if audio_timestep.dim() == 2 else audio_timestep
@@ -357,24 +385,92 @@ class LTX2TrigFlowDiffusionWrapper(LTX2DiffusionWrapper):
                 t_audio_timestep=t_audio_timestep,
             )
 
-        # Convert TrigFlow time to native RF sigma and delegate to forward_rf.
-        # rf_time = sin/(cos+sin) = sigma. No input scaling needed.
-        video_sigma = (torch.sin(timestep.float()) / (torch.cos(timestep.float()) + torch.sin(timestep.float())).clamp_min(1e-8)).to(dtype=noisy_image_or_video.dtype)
+        B = noisy_image_or_video.shape[0]
+        num_video_frames = noisy_image_or_video.shape[1]
 
-        audio_sigma = None
-        if noisy_audio is not None:
-            if audio_timestep is not None:
-                audio_sigma = (torch.sin(audio_timestep.float()) / (torch.cos(audio_timestep.float()) + torch.sin(audio_timestep.float())).clamp_min(1e-8)).to(dtype=noisy_audio.dtype)
-            else:
-                audio_sigma = video_sigma if video_sigma.dim() == 1 else video_sigma[:, 0]
-
-        return self.forward_rf(
-            noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict,
-            timestep=video_sigma,
-            noisy_audio=noisy_audio,
-            audio_timestep=audio_sigma,
+        # Scale TrigFlow latent back to RF scale: x_rf = x_trig / (cos+sin).
+        video_trig = timestep
+        video_trig_bcast = self._reshape_time_for_latent(video_trig, noisy_image_or_video.dim()).to(
+            dtype=noisy_image_or_video.dtype,
+            device=noisy_image_or_video.device,
         )
+        cos_v = torch.cos(video_trig_bcast)
+        sin_v = torch.sin(video_trig_bcast)
+        denom_v = (cos_v + sin_v).clamp_min(1e-8)
+        video_rf_latent = (noisy_image_or_video / denom_v).to(dtype=noisy_image_or_video.dtype)
+        # RF timestep: u = sin/(cos+sin) = sigma. Two versions:
+        # 1) broadcast shape for x0 = x_rf - u * v
+        video_rf_time = (sin_v / denom_v).to(dtype=noisy_image_or_video.dtype)
+        # 2) [B] or [B, F_v] shape for model timestep tokens
+        video_rf_time_tokens = self._rf_time_from_trig(
+            video_trig.to(dtype=noisy_image_or_video.dtype, device=noisy_image_or_video.device)
+        )
+        if video_rf_time_tokens.dim() == 2 and video_rf_time_tokens.shape[1] == 1:
+            video_rf_time_tokens = video_rf_time_tokens[:, 0]
+
+        video_flat = self._flatten_video_latent(video_rf_latent)
+        num_video_tokens = video_flat.shape[1]
+        video_positions = self._compute_video_positions(noisy_image_or_video)
+        video_timesteps = self._compute_timesteps_for_tokens(
+            video_rf_time_tokens, num_video_tokens, self.video_frame_seqlen,
+        )
+
+        from ltx_core.model.transformer.modality import Modality
+
+        video_modality = Modality(
+            latent=video_flat, timesteps=video_timesteps, positions=video_positions,
+            context=conditional_dict["video_context"],
+            context_mask=conditional_dict.get("attention_mask"), enabled=True,
+        )
+
+        audio_modality = None
+        audio_rf_time = None
+        audio_rf_latent = None
+        if noisy_audio is not None:
+            if audio_timestep is None:
+                audio_timestep = timestep if timestep.dim() == 1 else timestep[:, 0]
+            audio_trig = audio_timestep
+            audio_trig_bcast = self._reshape_time_for_latent(audio_trig, noisy_audio.dim()).to(
+                dtype=noisy_audio.dtype, device=noisy_audio.device,
+            )
+            cos_a = torch.cos(audio_trig_bcast)
+            sin_a = torch.sin(audio_trig_bcast)
+            denom_a = (cos_a + sin_a).clamp_min(1e-8)
+            audio_rf_latent = (noisy_audio / denom_a).to(dtype=noisy_audio.dtype)
+            audio_rf_time = (sin_a / denom_a).to(dtype=noisy_audio.dtype)
+            audio_rf_time_tokens = self._rf_time_from_trig(
+                audio_trig.to(dtype=noisy_audio.dtype, device=noisy_audio.device)
+            )
+            if audio_rf_time_tokens.dim() == 2 and audio_rf_time_tokens.shape[1] == 1:
+                audio_rf_time_tokens = audio_rf_time_tokens[:, 0]
+
+            num_audio_tokens = audio_rf_latent.shape[1]
+            audio_timesteps = self._compute_timesteps_for_tokens(
+                audio_rf_time_tokens, num_audio_tokens, 1,
+            )
+            audio_positions = self._compute_audio_positions(audio_rf_latent)
+
+            audio_modality = Modality(
+                latent=audio_rf_latent, timesteps=audio_timesteps, positions=audio_positions,
+                context=conditional_dict["audio_context"],
+                context_mask=conditional_dict.get("attention_mask"), enabled=True,
+            )
+
+        perturbations = BatchedPerturbationConfig.empty(batch_size=B)
+        video_v, audio_v = self.model(
+            video=video_modality, audio=audio_modality, perturbations=perturbations,
+        )
+
+        video_x0 = None
+        if video_v is not None:
+            video_v = self._unflatten_video_latent(video_v, num_video_frames)
+            video_x0 = (video_rf_latent - video_rf_time * video_v).to(dtype=noisy_image_or_video.dtype)
+
+        audio_x0 = None
+        if audio_v is not None:
+            audio_x0 = (audio_rf_latent - audio_rf_time * audio_v).to(dtype=noisy_audio.dtype)
+
+        return video_x0, audio_x0
 
     def forward_rf(
         self,
