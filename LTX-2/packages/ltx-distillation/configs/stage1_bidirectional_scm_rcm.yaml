@@ -54,7 +54,7 @@ beta1: 0.0
 beta2: 0.999
 weight_decay: 0.01
 dfake_gen_update_ratio: 1
-max_grad_norm: 1.0e12
+max_grad_norm: 5.0
 scheduler_type: constant
 
 ema_enabled: false
